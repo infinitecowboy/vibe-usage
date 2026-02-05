@@ -72,10 +72,17 @@ impl MenubarApp {
         // Wrap in Arc<Mutex> for sharing
         let tray = Arc::new(Mutex::new(tray_icon));
 
-        // Background thread: fetches data and updates AppState only
+        // Background thread: fetches data and updates AppState
         let bg_state = state.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to create tokio runtime: {}", e);
+                    return;
+                }
+            };
+
             loop {
                 let should_fetch = {
                     let s = bg_state.lock().unwrap();
@@ -88,12 +95,17 @@ impl MenubarApp {
                 if should_fetch {
                     let client = bg_state.lock().unwrap().client.clone();
                     if let Some(c) = client {
-                        if let Ok(r) = rt.block_on(c.fetch_usage()) {
-                            let usage = ParsedUsage::from(r);
-                            let mut s = bg_state.lock().unwrap();
-                            s.usage = Some(usage);
-                            s.needs_refresh = false;
-                            s.last_update = Some(Instant::now());
+                        match rt.block_on(c.fetch_usage()) {
+                            Ok(r) => {
+                                let usage = ParsedUsage::from(r);
+                                let mut s = bg_state.lock().unwrap();
+                                s.usage = Some(usage);
+                                s.needs_refresh = false;
+                                s.last_update = Some(Instant::now());
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch usage: {}", e);
+                            }
                         }
                     }
                 }
@@ -137,8 +149,8 @@ impl MenubarApp {
                         if let Ok(t) = tray.lock() {
                             let _ = t.set_icon(Some(icons.get(level).clone()));
                             let _ = t.set_tooltip(Some(tooltip));
-                            let _ = t.set_title(Some(title));
-                            let _ = t.set_menu(Some(Box::new(build_menu(Some(usage)))));
+                            t.set_title(Some(title));
+                            t.set_menu(Some(Box::new(build_menu(Some(usage)))));
                         }
                     }
                     last_rendered = current_usage;
@@ -196,18 +208,6 @@ fn build_menu(usage: Option<&ParsedUsage>) -> Menu {
     let _ = menu.append(&MenuItem::with_id("quit", "Quit", true, None));
 
     menu
-}
-
-fn get_indicator(percent: f32) -> &'static str {
-    if percent >= 95.0 {
-        "●" // red
-    } else if percent >= 80.0 {
-        "●" // orange
-    } else if percent >= 50.0 {
-        "●" // yellow
-    } else {
-        "●" // green
-    }
 }
 
 fn format_reset_time(iso: &str) -> String {

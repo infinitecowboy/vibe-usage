@@ -38,7 +38,6 @@ async fn main() -> Result<()> {
         .or_else(|| creds["access_token"].as_str())
         .ok_or_else(|| anyhow::anyhow!("No token field found"))?;
     println!("Token length: {} chars", token.len());
-    println!("Token prefix: {}...", &token[..20.min(token.len())]);
 
     // Test API
     println!("\n=== Testing API ===");
