@@ -152,7 +152,7 @@ fn build_menu(usage: Option<&ParsedUsage>) -> Menu {
     let menu = Menu::new();
 
     // Header
-    let _ = menu.append(&MenuItem::new("Claude Code Usage", false, None));
+    let _ = menu.append(&MenuItem::new("Claude Code Usage", true, None));
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     if let Some(u) = usage {
@@ -160,13 +160,13 @@ fn build_menu(usage: Option<&ParsedUsage>) -> Menu {
         let session_bar = ui::render_progress_bar(u.session_percent, 20);
         let _ = menu.append(&MenuItem::new(
             format!("Session:  {} {:.0}%", session_bar, u.session_percent),
-            false,
+            true,
             None,
         ));
         if let Some(ref reset) = u.session_reset {
             let _ = menu.append(&MenuItem::new(
                 format!("          Resets {}", format_reset_time(reset)),
-                false,
+                true,
                 None,
             ));
         }
@@ -177,13 +177,13 @@ fn build_menu(usage: Option<&ParsedUsage>) -> Menu {
         let weekly_bar = ui::render_progress_bar(u.weekly_percent, 20);
         let _ = menu.append(&MenuItem::new(
             format!("Weekly:   {} {:.0}%", weekly_bar, u.weekly_percent),
-            false,
+            true,
             None,
         ));
         if let Some(ref reset) = u.weekly_reset {
             let _ = menu.append(&MenuItem::new(
                 format!("          Resets {}", format_reset_time(reset)),
-                false,
+                true,
                 None,
             ));
         }
@@ -196,6 +196,18 @@ fn build_menu(usage: Option<&ParsedUsage>) -> Menu {
     let _ = menu.append(&MenuItem::with_id("quit", "Quit", true, None));
 
     menu
+}
+
+fn get_indicator(percent: f32) -> &'static str {
+    if percent >= 95.0 {
+        "●" // red
+    } else if percent >= 80.0 {
+        "●" // orange
+    } else if percent >= 50.0 {
+        "●" // yellow
+    } else {
+        "●" // green
+    }
 }
 
 fn format_reset_time(iso: &str) -> String {
