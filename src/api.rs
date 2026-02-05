@@ -12,23 +12,35 @@ pub struct UsageClient {
 pub struct UsageResponse {
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
+    pub seven_day_sonnet: Option<UsageWindow>,
+    pub extra_usage: Option<ExtraUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UsageWindow {
-    /// API returns "utilization" as a percentage (0-100)
     #[serde(default)]
     pub utilization: f32,
-    /// API returns "resets_at" (not "reset_at")
     pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExtraUsage {
+    pub is_enabled: bool,
+    pub monthly_limit: Option<f32>,
+    pub used_credits: Option<f32>,
+    pub utilization: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedUsage {
     pub session_percent: f32,
-    pub weekly_percent: f32,
     pub session_reset: Option<String>,
+    pub weekly_percent: f32,
     pub weekly_reset: Option<String>,
+    pub sonnet_percent: Option<f32>,
+    pub sonnet_reset: Option<String>,
+    pub extra_usage_enabled: bool,
+    pub extra_usage_percent: Option<f32>,
     pub max_percent: f32,
 }
 
@@ -64,12 +76,30 @@ impl From<UsageResponse> for ParsedUsage {
     fn from(r: UsageResponse) -> Self {
         let session_percent = r.five_hour.as_ref().map(|w| w.utilization).unwrap_or(0.0);
         let weekly_percent = r.seven_day.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+        let sonnet_percent = r.seven_day_sonnet.as_ref().map(|w| w.utilization);
+
+        let extra_usage_enabled = r
+            .extra_usage
+            .as_ref()
+            .map(|e| e.is_enabled)
+            .unwrap_or(false);
+        let extra_usage_percent = r.extra_usage.as_ref().and_then(|e| e.utilization);
+
+        // Max percent for icon color (only count enabled/active limits)
+        let max_percent = session_percent
+            .max(weekly_percent)
+            .max(sonnet_percent.unwrap_or(0.0));
+
         Self {
             session_percent,
-            weekly_percent,
             session_reset: r.five_hour.and_then(|w| w.resets_at),
+            weekly_percent,
             weekly_reset: r.seven_day.and_then(|w| w.resets_at),
-            max_percent: session_percent.max(weekly_percent),
+            sonnet_percent,
+            sonnet_reset: r.seven_day_sonnet.and_then(|w| w.resets_at),
+            extra_usage_enabled,
+            extra_usage_percent,
+            max_percent,
         }
     }
 }
