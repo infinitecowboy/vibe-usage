@@ -1,12 +1,7 @@
 use crate::api::ParsedUsage;
+use ab_glyph::{FontRef, PxScale};
 use image::{Rgba, RgbaImage};
-use tray_icon::Icon;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IconStyle {
-    Dot,
-    Bars,
-}
+use imageproc::drawing::draw_text_mut;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UsageLevel {
@@ -39,190 +34,151 @@ impl UsageLevel {
     }
 }
 
-/// Generate a dot icon with the given color level
-pub fn generate_dot_icon(level: UsageLevel) -> anyhow::Result<Icon> {
-    let size = 44u32;
-    let color = level.color();
-    let center = size as f32 / 2.0;
+fn gray_color() -> Rgba<u8> {
+    Rgba([120, 120, 125, 180])
+}
 
-    let outer_radius = 10.0;
-    let border_width = 2.0;
-    let inner_radius = outer_radius - border_width;
-    let aa_width = 1.0;
+fn text_color() -> Rgba<u8> {
+    Rgba([255, 255, 255, 255])
+}
 
-    let border_color = Rgba([255, 255, 255, 230]);
+const FONT_DATA: &[u8] = include_bytes!("/System/Library/Fonts/Helvetica.ttc");
 
-    let mut img = RgbaImage::new(size, size);
-    for y in 0..size {
-        for x in 0..size {
-            let d = ((x as f32 - center).powi(2) + (y as f32 - center).powi(2)).sqrt();
+/// Raw icon data for direct NSImage creation.
+pub struct RawIcon {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
 
-            if d <= inner_radius - aa_width {
-                img.put_pixel(x, y, color);
-            } else if d <= inner_radius {
-                let alpha = ((inner_radius - d) / aa_width * 255.0).clamp(0.0, 255.0) as u8;
-                img.put_pixel(x, y, Rgba([color[0], color[1], color[2], alpha]));
-            } else if d <= outer_radius - aa_width {
-                img.put_pixel(x, y, border_color);
-            } else if d <= outer_radius {
-                let alpha = ((outer_radius - d) / aa_width * 230.0).clamp(0.0, 230.0) as u8;
+const ICON_WIDTH: u32 = 200;
+const ICON_HEIGHT: u32 = 44;
+
+/// Generate status bar icon (dot + text + bars) as raw RGBA pixels.
+pub fn generate_status_icon_raw(
+    level: UsageLevel,
+    usage: Option<&ParsedUsage>,
+) -> anyhow::Result<RawIcon> {
+    let mut img = RgbaImage::new(ICON_WIDTH, ICON_HEIGHT);
+    let center_y = ICON_HEIGHT / 2;
+
+    let font =
+        FontRef::try_from_slice(FONT_DATA).map_err(|e| anyhow::anyhow!("Font error: {}", e))?;
+    let scale = PxScale::from(28.0);
+    let text_col = text_color();
+    let text_y = 18i32;
+
+    // 1. Draw dot (session indicator)
+    let session_level = usage
+        .map(|u| UsageLevel::from_percent(u.session_percent))
+        .unwrap_or(level);
+    let dot_color = session_level.color();
+    let dot_cx = 10.0f32;
+    let dot_cy = center_y as f32;
+    let dot_r = 8.0f32;
+
+    for y in 0..ICON_HEIGHT {
+        for x in 0..22 {
+            let d = ((x as f32 - dot_cx).powi(2) + (y as f32 - dot_cy).powi(2)).sqrt();
+            if d <= dot_r {
+                let alpha = if d <= dot_r - 1.5 {
+                    255
+                } else {
+                    ((dot_r - d) / 1.5 * 255.0) as u8
+                };
                 img.put_pixel(
                     x,
                     y,
-                    Rgba([border_color[0], border_color[1], border_color[2], alpha]),
+                    Rgba([dot_color[0], dot_color[1], dot_color[2], alpha]),
                 );
             }
         }
     }
-    Icon::from_rgba(img.into_raw(), size, size).map_err(|e| anyhow::anyhow!("{}", e))
+
+    // 2. Session percentage text
+    let session_pct = usage.map(|u| u.session_percent).unwrap_or(0.0);
+    let session_text = format!("{:.0}%", session_pct);
+    draw_text_mut(&mut img, text_col, 24, text_y, scale, &font, &session_text);
+
+    // 3. Signal bars (weekly indicator)
+    let weekly_section_start = 100u32;
+    let weekly_level = usage
+        .map(|u| UsageLevel::from_percent(u.weekly_percent))
+        .unwrap_or(level);
+    let bar_color = weekly_level.color();
+    let gray = gray_color();
+
+    let weekly_pct = usage.map(|u| u.weekly_percent).unwrap_or(0.0);
+    let filled_bars = if weekly_pct >= 75.0 {
+        4
+    } else if weekly_pct >= 50.0 {
+        3
+    } else if weekly_pct >= 25.0 {
+        2
+    } else if weekly_pct > 0.0 {
+        1
+    } else {
+        0
+    };
+
+    let bar_width = 10u32;
+    let bar_gap = 3u32;
+    let bar_heights = [16u32, 24u32, 32u32, 40u32];
+    let base_y = 42u32;
+
+    for (i, &bar_h) in bar_heights.iter().enumerate() {
+        let bx = weekly_section_start + (i as u32) * (bar_width + bar_gap);
+        let by = base_y - bar_h;
+        let is_filled = (i as i32) < filled_bars;
+        let color = if is_filled { bar_color } else { gray };
+
+        draw_bar(&mut img, bx, by, bar_width, bar_h, color, is_filled);
+    }
+
+    // 4. Weekly percentage text
+    let weekly_text = format!("{:.0}%", weekly_pct);
+    draw_text_mut(&mut img, text_col, 156, text_y, scale, &font, &weekly_text);
+
+    Ok(RawIcon {
+        rgba: img.into_raw(),
+        width: ICON_WIDTH,
+        height: ICON_HEIGHT,
+    })
 }
 
-/// Generate a stacking bars icon showing session and weekly usage
-pub fn generate_bars_icon(usage: &ParsedUsage) -> anyhow::Result<Icon> {
-    let size = 44u32;
-    let mut img = RgbaImage::new(size, size);
-
-    // Bar dimensions
-    let bar_width = 8u32;
-    let bar_height = 32u32;
-    let gap = 4u32;
-    let start_y = (size - bar_height) / 2;
-
-    // Two bars: session (left) and weekly (right)
-    let bar1_x = (size - 2 * bar_width - gap) / 2;
-    let bar2_x = bar1_x + bar_width + gap;
-
-    // Background color (dark gray)
-    let bg_color = Rgba([80, 80, 85, 255]);
-
-    // Draw session bar (left)
-    let session_level = UsageLevel::from_percent(usage.session_percent);
-    let session_color = session_level.color();
-    let session_fill = ((usage.session_percent / 100.0) * bar_height as f32).round() as u32;
-    draw_bar(
-        &mut img,
-        bar1_x,
-        start_y,
-        bar_width,
-        bar_height,
-        session_fill,
-        session_color,
-        bg_color,
-    );
-
-    // Draw weekly bar (right)
-    let weekly_level = UsageLevel::from_percent(usage.weekly_percent);
-    let weekly_color = weekly_level.color();
-    let weekly_fill = ((usage.weekly_percent / 100.0) * bar_height as f32).round() as u32;
-    draw_bar(
-        &mut img,
-        bar2_x,
-        start_y,
-        bar_width,
-        bar_height,
-        weekly_fill,
-        weekly_color,
-        bg_color,
-    );
-
-    Icon::from_rgba(img.into_raw(), size, size).map_err(|e| anyhow::anyhow!("{}", e))
-}
-
-fn draw_bar(
-    img: &mut RgbaImage,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    fill_height: u32,
-    fill_color: Rgba<u8>,
-    bg_color: Rgba<u8>,
-) {
-    let corner_radius = 2.0f32;
-
-    for dy in 0..height {
-        for dx in 0..width {
+fn draw_bar(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>, filled: bool) {
+    let r = 2.0f32;
+    for dy in 0..h {
+        for dx in 0..w {
+            if !in_rounded_rect(dx as f32, dy as f32, w as f32, h as f32, r) {
+                continue;
+            }
             let px = x + dx;
             let py = y + dy;
-
-            // Check if within rounded corners
-            let in_bar = is_in_rounded_rect(
-                dx as f32,
-                dy as f32,
-                width as f32,
-                height as f32,
-                corner_radius,
-            );
-
-            if in_bar {
-                // Fill from bottom up
-                let fill_start = height.saturating_sub(fill_height);
-                if dy >= fill_start {
-                    img.put_pixel(px, py, fill_color);
-                } else {
-                    img.put_pixel(px, py, bg_color);
+            if filled {
+                img.put_pixel(px, py, color);
+            } else {
+                let border = dx <= 1 || dx >= w - 2 || dy <= 1 || dy >= h - 2;
+                if border {
+                    img.put_pixel(px, py, color);
                 }
             }
         }
     }
 }
 
-fn is_in_rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
-    // Check corners
+fn in_rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
     if x < r && y < r {
-        // Top-left corner
-        let dx = r - x;
-        let dy = r - y;
-        return dx * dx + dy * dy <= r * r;
+        return (r - x).powi(2) + (r - y).powi(2) <= r * r;
     }
     if x >= w - r && y < r {
-        // Top-right corner
-        let dx = x - (w - r);
-        let dy = r - y;
-        return dx * dx + dy * dy <= r * r;
+        return (x - (w - r)).powi(2) + (r - y).powi(2) <= r * r;
     }
     if x < r && y >= h - r {
-        // Bottom-left corner
-        let dx = r - x;
-        let dy = y - (h - r);
-        return dx * dx + dy * dy <= r * r;
+        return (r - x).powi(2) + (y - (h - r)).powi(2) <= r * r;
     }
     if x >= w - r && y >= h - r {
-        // Bottom-right corner
-        let dx = x - (w - r);
-        let dy = y - (h - r);
-        return dx * dx + dy * dy <= r * r;
+        return (x - (w - r)).powi(2) + (y - (h - r)).powi(2) <= r * r;
     }
     true
-}
-
-pub struct IconSet {
-    pub green: Icon,
-    pub yellow: Icon,
-    pub orange: Icon,
-    pub red: Icon,
-}
-
-impl IconSet {
-    pub fn new() -> anyhow::Result<Self> {
-        Ok(Self {
-            green: generate_dot_icon(UsageLevel::Green)?,
-            yellow: generate_dot_icon(UsageLevel::Yellow)?,
-            orange: generate_dot_icon(UsageLevel::Orange)?,
-            red: generate_dot_icon(UsageLevel::Red)?,
-        })
-    }
-
-    pub fn get(&self, level: UsageLevel) -> &Icon {
-        match level {
-            UsageLevel::Green => &self.green,
-            UsageLevel::Yellow => &self.yellow,
-            UsageLevel::Orange => &self.orange,
-            UsageLevel::Red => &self.red,
-        }
-    }
-
-    pub fn get_bars(&self, usage: &ParsedUsage) -> Icon {
-        generate_bars_icon(usage).unwrap_or_else(|_| self.green.clone())
-    }
 }

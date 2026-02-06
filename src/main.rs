@@ -2,7 +2,6 @@ mod api;
 mod icons;
 mod keychain;
 mod menubar;
-mod ui;
 
 use anyhow::Result;
 

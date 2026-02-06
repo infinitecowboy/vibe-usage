@@ -26,8 +26,6 @@ pub struct UsageWindow {
 #[derive(Debug, Deserialize)]
 pub struct ExtraUsage {
     pub is_enabled: bool,
-    pub monthly_limit: Option<f32>,
-    pub used_credits: Option<f32>,
     pub utilization: Option<f32>,
 }
 
