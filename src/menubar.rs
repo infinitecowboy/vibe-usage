@@ -1,13 +1,15 @@
 use crate::{
     api::{ParsedUsage, UsageClient},
-    icons::{generate_status_icon_raw, RawIcon, UsageLevel},
-    keychain,
+    history,
+    icons::{generate_status_icon_raw, is_template, RawIcon, SectionVisibility, UsageLevel},
+    keychain, settings,
 };
 use anyhow::Result;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicy};
 use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use objc::{class, msg_send, sel, sel_impl};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tao::event::Event;
@@ -19,12 +21,210 @@ unsafe impl Sync for SendId {}
 
 static STATUS_ITEM: OnceLock<Mutex<SendId>> = OnceLock::new();
 static STATUS_INFO: OnceLock<StatusInfo> = OnceLock::new();
+static REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SETTINGS_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// Register an ObjC class to handle menu actions (refresh, settings, copy).
+unsafe fn register_menu_handler() -> id {
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Object, Sel};
+
+    let superclass = Class::get("NSObject").unwrap();
+    let mut decl = ClassDecl::new("MenuHandler", superclass).unwrap();
+
+    extern "C" fn refresh_action(_this: &Object, _cmd: Sel, _sender: id) {
+        REFRESH_REQUESTED.store(true, Ordering::Relaxed);
+    }
+
+    // Icon type actions: tag encodes the IconType variant index
+    extern "C" fn set_icon_type_action(_this: &Object, _cmd: Sel, sender: id) {
+        let tag: isize = unsafe { msg_send![sender, tag] };
+        let icon_type = match tag {
+            0 => settings::IconType::Dot,
+            1 => settings::IconType::SignalBars,
+            2 => settings::IconType::MiniBars,
+            3 => settings::IconType::DotGrid,
+            _ => return,
+        };
+        settings::update(|s| s.icon_type = icon_type);
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    // Toggle show_icon (at least one of icon/label/number must remain on)
+    extern "C" fn toggle_icon_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| {
+            let new_val = !s.show_icon;
+            if new_val || s.show_label || s.show_number {
+                s.show_icon = new_val;
+            }
+        });
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    // Toggle show_label (at least one of icon/label/number must remain on)
+    extern "C" fn toggle_label_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| {
+            let new_val = !s.show_label;
+            if new_val || s.show_icon || s.show_number {
+                s.show_label = new_val;
+            }
+        });
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    // Toggle show_number (at least one of icon/label/number must remain on)
+    extern "C" fn toggle_number_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| {
+            let new_val = !s.show_number;
+            if new_val || s.show_icon || s.show_label {
+                s.show_number = new_val;
+            }
+        });
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    // Toggle section visibility: tag encodes which section (0=session, 1=weekly, 2=sonnet, 3=extra)
+    extern "C" fn toggle_section_action(_this: &Object, _cmd: Sel, sender: id) {
+        let tag: isize = unsafe { msg_send![sender, tag] };
+        settings::update(|s| match tag {
+            0 => s.show_session = !s.show_session,
+            1 => s.show_weekly = !s.show_weekly,
+            2 => s.show_sonnet = !s.show_sonnet,
+            3 => s.show_extra = !s.show_extra,
+            _ => {}
+        });
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn toggle_notify_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| s.notify_enabled = !s.notify_enabled);
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn set_session_threshold_action(_this: &Object, _cmd: Sel, sender: id) {
+        let tag: isize = unsafe { msg_send![sender, tag] };
+        settings::update(|s| s.notify_session_threshold = tag as u32);
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn set_weekly_threshold_action(_this: &Object, _cmd: Sel, sender: id) {
+        let tag: isize = unsafe { msg_send![sender, tag] };
+        settings::update(|s| s.notify_weekly_threshold = tag as u32);
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn set_refresh_interval_action(_this: &Object, _cmd: Sel, sender: id) {
+        let tag: isize = unsafe { msg_send![sender, tag] };
+        settings::update(|s| s.refresh_interval = settings::RefreshInterval(tag as u64));
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn toggle_launch_at_login_action(_this: &Object, _cmd: Sel, _sender: id) {
+        let new_val = {
+            let cfg = settings::get();
+            !cfg.launch_at_login
+        };
+        settings::update(|s| s.launch_at_login = new_val);
+        set_launch_at_login(new_val);
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn toggle_icons_colored_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| s.icons_colored = !s.icons_colored);
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn toggle_monochrome_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| {
+            s.color_palette = match s.color_palette {
+                settings::ColorPalette::Monochrome => settings::ColorPalette::Default,
+                _ => settings::ColorPalette::Monochrome,
+            };
+        });
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn set_thresholds_action(_this: &Object, _cmd: Sel, sender: id) {
+        let tag: isize = unsafe { msg_send![sender, tag] };
+        if let Some((_, preset)) = settings::ColorThresholds::PRESETS.get(tag as usize) {
+            settings::update(|s| s.color_thresholds = *preset);
+            SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+        }
+    }
+
+    decl.add_method(
+        sel!(refreshAction:),
+        refresh_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(setIconTypeAction:),
+        set_icon_type_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleIconAction:),
+        toggle_icon_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleLabelAction:),
+        toggle_label_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleNumberAction:),
+        toggle_number_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleSectionAction:),
+        toggle_section_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleNotifyAction:),
+        toggle_notify_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(setSessionThresholdAction:),
+        set_session_threshold_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(setWeeklyThresholdAction:),
+        set_weekly_threshold_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(setRefreshIntervalAction:),
+        set_refresh_interval_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleLaunchAtLoginAction:),
+        toggle_launch_at_login_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleIconsColoredAction:),
+        toggle_icons_colored_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleMonochromeAction:),
+        toggle_monochrome_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(setThresholdsAction:),
+        set_thresholds_action as extern "C" fn(&Object, Sel, id),
+    );
+
+    decl.register();
+
+    let cls = Class::get("MenuHandler").unwrap();
+    let obj: id = msg_send![cls, new];
+    let () = msg_send![obj, retain];
+    obj
+}
+
+static MENU_HANDLER: OnceLock<SendId> = OnceLock::new();
 
 struct StatusInfo {
     version: String,
     model_alias: String,
     model_full: String,
     plan: String,
+    #[allow(dead_code)]
     session_id: Option<String>,
 }
 
@@ -33,6 +233,7 @@ struct AppState {
     client: Option<UsageClient>,
     needs_refresh: bool,
     last_update: Option<Instant>,
+    consecutive_failures: u32,
 }
 
 pub struct MenubarApp {
@@ -41,9 +242,10 @@ pub struct MenubarApp {
 
 impl MenubarApp {
     pub fn new() -> Result<Self> {
-        let client = keychain::get_oauth_token()
-            .ok()
-            .and_then(|t| UsageClient::new(t).ok());
+        settings::init();
+        history::init();
+
+        let client = UsageClient::new().ok();
 
         STATUS_INFO.get_or_init(|| gather_status_info());
 
@@ -53,6 +255,7 @@ impl MenubarApp {
                 client,
                 needs_refresh: true,
                 last_update: None,
+                consecutive_failures: 0,
             })),
         })
     }
@@ -78,8 +281,28 @@ impl MenubarApp {
             let button: id = msg_send![status_item, button];
 
             // Set initial icon
-            if let Ok(raw) = generate_status_icon_raw(UsageLevel::Green, None) {
-                set_button_image(button, &raw);
+            let cfg = settings::get();
+            let vis = SectionVisibility {
+                session: cfg.show_session,
+                weekly: cfg.show_weekly,
+            };
+            if let Ok(raw) = generate_status_icon_raw(
+                UsageLevel::Low,
+                None,
+                cfg.icon_type,
+                cfg.show_icon,
+                cfg.show_label,
+                cfg.show_number,
+                cfg.color_palette,
+                &cfg.color_thresholds,
+                vis,
+                cfg.icons_colored,
+            ) {
+                set_button_image(
+                    button,
+                    &raw,
+                    is_template(cfg.color_palette, cfg.icons_colored),
+                );
             }
 
             // Build initial menu
@@ -87,6 +310,7 @@ impl MenubarApp {
             let () = msg_send![status_item, setMenu: menu];
 
             STATUS_ITEM.get_or_init(|| Mutex::new(SendId(status_item)));
+            MENU_HANDLER.get_or_init(|| SendId(register_menu_handler()));
             tracing::info!("Status item created with menu");
         }
 
@@ -102,33 +326,62 @@ impl MenubarApp {
             };
 
             loop {
-                let should_fetch = {
+                let (interval_secs, should_fetch, failures) = {
                     let s = bg_state.lock().unwrap();
-                    s.needs_refresh
+                    let interval = settings::get().refresh_interval.0;
+                    let fetch = s.needs_refresh
                         || s.last_update
-                            .map(|t| t.elapsed() > Duration::from_secs(300))
-                            .unwrap_or(true)
+                            .map(|t| t.elapsed() > Duration::from_secs(interval))
+                            .unwrap_or(true);
+                    (interval, fetch, s.consecutive_failures)
+                };
+
+                // Backoff: on repeated failures, wait longer before retrying
+                // (2^failures seconds, capped at the configured interval)
+                let backoff = if failures > 0 {
+                    Duration::from_secs((2u64.saturating_pow(failures)).min(interval_secs))
+                } else {
+                    Duration::ZERO
                 };
 
                 if should_fetch {
                     let client = bg_state.lock().unwrap().client.clone();
                     if let Some(c) = client {
-                        match rt.block_on(c.fetch_usage()) {
-                            Ok(r) => {
-                                let usage = ParsedUsage::from(r);
+                        // Re-read token from keychain each time (tokens rotate)
+                        let token = keychain::get_oauth_token();
+                        match token {
+                            Ok(tok) => match rt.block_on(c.fetch_usage(&tok)) {
+                                Ok(r) => {
+                                    let usage = ParsedUsage::from(r);
+                                    check_and_notify(&usage);
+                                    history::record(&usage);
+                                    let mut s = bg_state.lock().unwrap();
+                                    s.usage = Some(usage);
+                                    s.needs_refresh = false;
+                                    s.last_update = Some(Instant::now());
+                                    s.consecutive_failures = 0;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to fetch usage: {}", e);
+                                    let mut s = bg_state.lock().unwrap();
+                                    s.needs_refresh = false;
+                                    s.last_update = Some(Instant::now());
+                                    s.consecutive_failures =
+                                        s.consecutive_failures.saturating_add(1);
+                                }
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to read token from keychain: {}", e);
                                 let mut s = bg_state.lock().unwrap();
-                                s.usage = Some(usage);
                                 s.needs_refresh = false;
                                 s.last_update = Some(Instant::now());
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to fetch usage: {}", e);
+                                s.consecutive_failures = s.consecutive_failures.saturating_add(1);
                             }
                         }
                     }
                 }
 
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_secs(1).max(backoff));
             }
         });
 
@@ -138,21 +391,54 @@ impl MenubarApp {
             *cf = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500));
 
             if let Event::NewEvents(_) = event {
+                // Check if refresh was requested from menu
+                if REFRESH_REQUESTED.swap(false, Ordering::Relaxed) {
+                    let mut s = state.lock().unwrap();
+                    s.needs_refresh = true;
+                    s.consecutive_failures = 0; // reset backoff on manual refresh
+                }
+
+                // Force re-render on settings change
+                let settings_dirty = SETTINGS_CHANGED.swap(false, Ordering::Relaxed);
+
                 let current_usage = {
                     let s = state.lock().unwrap();
                     s.usage.clone()
                 };
 
-                if current_usage != last_rendered {
+                if current_usage != last_rendered || settings_dirty {
                     if let Some(si) = STATUS_ITEM.get() {
                         let si = si.lock().unwrap();
                         unsafe {
                             if let Some(ref usage) = current_usage {
-                                // Update icon
-                                let level = UsageLevel::from_percent(usage.max_percent);
-                                if let Ok(raw) = generate_status_icon_raw(level, Some(usage)) {
+                                // Update icon based on style
+                                let cfg = settings::get();
+                                let level = UsageLevel::from_percent(
+                                    usage.max_percent,
+                                    &cfg.color_thresholds,
+                                );
+                                let vis = SectionVisibility {
+                                    session: cfg.show_session,
+                                    weekly: cfg.show_weekly,
+                                };
+                                if let Ok(raw) = generate_status_icon_raw(
+                                    level,
+                                    Some(usage),
+                                    cfg.icon_type,
+                                    cfg.show_icon,
+                                    cfg.show_label,
+                                    cfg.show_number,
+                                    cfg.color_palette,
+                                    &cfg.color_thresholds,
+                                    vis,
+                                    cfg.icons_colored,
+                                ) {
                                     let button: id = msg_send![si.0, button];
-                                    set_button_image(button, &raw);
+                                    set_button_image(
+                                        button,
+                                        &raw,
+                                        is_template(cfg.color_palette, cfg.icons_colored),
+                                    );
                                 }
                             }
 
@@ -179,54 +465,89 @@ const CORNER_RADIUS: f64 = 3.0;
 unsafe fn build_menu(usage: Option<&ParsedUsage>) -> id {
     let menu: id = msg_send![class!(NSMenu), new];
     let () = msg_send![menu, setMinimumWidth: MENU_WIDTH];
+    let cfg = settings::get();
+    let mut has_section = false;
 
     if let Some(u) = usage {
         // Session
-        add_section(
-            menu,
-            "Session",
-            u.session_percent,
-            u.session_reset.as_deref(),
-        );
-
-        let () = msg_send![menu, addItem: separator()];
+        if cfg.show_session {
+            add_section(
+                menu,
+                "Session",
+                u.session_percent,
+                u.session_reset.as_deref(),
+            );
+            has_section = true;
+        }
 
         // Weekly (all models)
-        add_section(menu, "Weekly", u.weekly_percent, u.weekly_reset.as_deref());
-
-        let () = msg_send![menu, addItem: separator()];
+        if cfg.show_weekly {
+            if has_section {
+                let () = msg_send![menu, addItem: separator()];
+            }
+            add_section(menu, "Weekly", u.weekly_percent, u.weekly_reset.as_deref());
+            has_section = true;
+        }
 
         // Sonnet only
-        add_section(
-            menu,
-            "Sonnet only",
-            u.sonnet_percent.unwrap_or(0.0),
-            u.sonnet_reset.as_deref(),
-        );
-
-        let () = msg_send![menu, addItem: separator()];
+        if cfg.show_sonnet {
+            if has_section {
+                let () = msg_send![menu, addItem: separator()];
+            }
+            add_section(
+                menu,
+                "Sonnet only",
+                u.sonnet_percent.unwrap_or(0.0),
+                u.sonnet_reset.as_deref(),
+            );
+            has_section = true;
+        }
 
         // Extra usage
-        let extra = if u.extra_usage_enabled {
-            u.extra_usage_percent
-                .map(|p| format!("Extra usage: {:.0}% consumed", p))
-                .unwrap_or_else(|| "Extra usage enabled".to_string())
-        } else {
-            "Extra usage not enabled".to_string()
-        };
-        let () = msg_send![menu, addItem: menu_item_with_view(extra_usage_view(&extra))];
+        if cfg.show_extra {
+            if has_section {
+                let () = msg_send![menu, addItem: separator()];
+            }
+            let extra = if u.extra_usage_enabled {
+                u.extra_usage_percent
+                    .map(|p| format!("Extra usage: {:.0}% consumed", p))
+                    .unwrap_or_else(|| "Extra usage enabled".to_string())
+            } else {
+                "Extra usage not enabled".to_string()
+            };
+            let () = msg_send![menu, addItem: menu_item_with_view(extra_usage_view(&extra))];
+            has_section = true;
+        }
     } else {
         let () =
             msg_send![menu, addItem: text_item("Loading\u{2026}", 12.0, false, secondary_color())];
+        has_section = true;
+    }
+
+    // Sparkline
+    if let Some(spark_view) = sparkline_section_view() {
+        if has_section {
+            let () = msg_send![menu, addItem: separator()];
+        }
+        let () = msg_send![menu, addItem: menu_item_with_view(spark_view)];
+        has_section = true;
     }
 
     // Status info
     if let Some(info) = STATUS_INFO.get() {
-        let () = msg_send![menu, addItem: separator()];
+        if has_section {
+            let () = msg_send![menu, addItem: separator()];
+        }
         let () = msg_send![menu, addItem: menu_item_with_view(status_section_view(info))];
     }
 
     let () = msg_send![menu, addItem: separator()];
+
+    // Settings submenu
+    let () = msg_send![menu, addItem: settings_submenu_item(&cfg)];
+
+    // Refresh / Quit
+    let () = msg_send![menu, addItem: refresh_item()];
     let () = msg_send![menu, addItem: quit_item()];
 
     menu
@@ -301,7 +622,7 @@ unsafe fn extra_usage_view(text: &str) -> id {
 /// Create a compact status info view with key-value rows.
 unsafe fn status_section_view(info: &StatusInfo) -> id {
     let row_h: f64 = 16.0;
-    let mut rows: Vec<(&str, String)> = vec![
+    let rows: Vec<(&str, String)> = vec![
         ("Version", info.version.clone()),
         (
             "Model",
@@ -331,6 +652,338 @@ unsafe fn status_section_view(info: &StatusInfo) -> id {
     }
 
     view
+}
+
+// ── Sparkline ────────────────────────────────────────────────────────
+
+const SPARKLINE_W: u32 = 400; // 200pt @ 2x retina
+const SPARKLINE_H: u32 = 120; // 60pt @ 2x retina
+const SPARKLINE_PT_H: f64 = 60.0;
+
+/// Render a chart from history data and wrap in an NSView menu item.
+unsafe fn sparkline_section_view() -> Option<id> {
+    let data = history::get_history();
+    if data.len() < 2 {
+        return None;
+    }
+
+    let cfg = settings::get();
+    let cutoff = chrono::Utc::now().timestamp() - 24 * 3600;
+
+    let filtered: Vec<&history::HistoryEntry> = data.iter().filter(|e| e.ts >= cutoff).collect();
+    if filtered.len() < 2 {
+        return None;
+    }
+
+    let session_points: Vec<(i64, f32)> = filtered.iter().map(|e| (e.ts, e.session)).collect();
+    let weekly_points: Vec<(i64, f32)> = filtered.iter().map(|e| (e.ts, e.weekly)).collect();
+
+    let show_s = cfg.show_session;
+    let show_w = cfg.show_weekly;
+
+    let (raw, y_min_val, y_max_val) = render_sparkline(
+        &session_points,
+        &weekly_points,
+        show_s,
+        show_w,
+        cfg.color_palette,
+        &cfg.color_thresholds,
+    )?;
+    let title = "Usage (24h)";
+
+    // title (14pt) + legend (12pt) + sparkline (60pt) + padding = total
+    let total_h: f64 = 100.0;
+    let chart_x: f64 = 40.0; // left margin for y-axis labels
+    let chart_w: f64 = MENU_WIDTH - chart_x - 16.0; // right padding
+
+    let view: id = msg_send![class!(NSView), alloc];
+    let view: id = msg_send![view, initWithFrame: NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(MENU_WIDTH, total_h),
+    )];
+
+    // Title label
+    let label = make_label(title, 10.0, true, secondary_color());
+    set_frame(label, 16.0, total_h - 16.0, BAR_WIDTH, 14.0);
+    let () = msg_send![view, addSubview: label];
+
+    // Legend: conditionally show "— Session" and/or "— Weekly" with threshold colors
+    let legend_y = total_h - 28.0;
+    let mut legend_x = 16.0f64;
+
+    if show_s {
+        let s_pct = filtered.last().map(|e| e.session).unwrap_or(0.0);
+        let s_rgb = threshold_rgb(s_pct, cfg.color_palette, &cfg.color_thresholds);
+        let s_color = NSColor_rgba(
+            s_rgb[0] as f64 / 255.0,
+            s_rgb[1] as f64 / 255.0,
+            s_rgb[2] as f64 / 255.0,
+            1.0,
+        );
+        let s_dash = make_label("—", 9.0, true, s_color);
+        set_frame(s_dash, legend_x, legend_y, 14.0, 12.0);
+        let () = msg_send![view, addSubview: s_dash];
+        let s_label = make_label("Session", 9.0, false, secondary_color());
+        set_frame(s_label, legend_x + 14.0, legend_y, 46.0, 12.0);
+        let () = msg_send![view, addSubview: s_label];
+        legend_x += 64.0;
+    }
+
+    if show_w {
+        let w_pct = filtered.last().map(|e| e.weekly).unwrap_or(0.0);
+        let w_rgb = threshold_rgb(w_pct, cfg.color_palette, &cfg.color_thresholds);
+        let w_color = NSColor_rgba(
+            w_rgb[0] as f64 / 255.0,
+            w_rgb[1] as f64 / 255.0,
+            w_rgb[2] as f64 / 255.0,
+            1.0,
+        );
+        let w_dash = make_label("—", 9.0, true, w_color);
+        set_frame(w_dash, legend_x, legend_y, 14.0, 12.0);
+        let () = msg_send![view, addSubview: w_dash];
+        let w_label = make_label("Weekly", 9.0, false, secondary_color());
+        set_frame(w_label, legend_x + 14.0, legend_y, 46.0, 12.0);
+        let () = msg_send![view, addSubview: w_label];
+    }
+
+    // Y-axis labels (max at top, min at bottom of chart area)
+    let chart_bottom: f64 = 4.0;
+    let max_label = make_label(&format!("{:.0}%", y_max_val), 9.0, false, secondary_color());
+    set_frame(
+        max_label,
+        16.0,
+        chart_bottom + SPARKLINE_PT_H - 12.0,
+        30.0,
+        12.0,
+    );
+    let () = msg_send![view, addSubview: max_label];
+
+    let min_label = make_label(&format!("{:.0}%", y_min_val), 9.0, false, secondary_color());
+    set_frame(min_label, 16.0, chart_bottom, 30.0, 12.0);
+    let () = msg_send![view, addSubview: min_label];
+
+    // NSImage from raw pixels
+    let ns_image = raw_to_nsimage(&raw);
+    if ns_image == nil {
+        return None;
+    }
+
+    let image_view: id = msg_send![class!(NSImageView), alloc];
+    let image_view: id = msg_send![image_view, initWithFrame: NSRect::new(
+        NSPoint::new(chart_x, chart_bottom),
+        NSSize::new(chart_w, SPARKLINE_PT_H),
+    )];
+    let () = msg_send![image_view, setImage: ns_image];
+    let () = msg_send![image_view, setImageScaling: 3i64]; // NSImageScaleProportionallyUpOrDown
+    let () = msg_send![view, addSubview: image_view];
+
+    Some(view)
+}
+
+/// Interpolate a series of (timestamp, value) points at a given pixel x position.
+fn interpolate_series(points: &[(i64, f32)], px: u32, w: u32, min_t: f64, t_range: f64) -> f64 {
+    let t_frac = px as f64 / (w - 1) as f64;
+    let t_at_px = min_t + t_frac * t_range;
+
+    let mut val = points[0].1 as f64;
+    for i in 0..points.len().saturating_sub(1) {
+        let (t0, v0) = (points[i].0 as f64, points[i].1 as f64);
+        let (t1, v1) = (points[i + 1].0 as f64, points[i + 1].1 as f64);
+        if t_at_px <= t1 {
+            let frac = ((t_at_px - t0) / (t1 - t0).max(1.0)).clamp(0.0, 1.0);
+            val = v0 + frac * (v1 - v0);
+            break;
+        }
+        val = v1;
+    }
+    val
+}
+
+/// Simple alpha-over blend for chart pixels.
+fn alpha_blend_chart(dst: image::Rgba<u8>, src: image::Rgba<u8>) -> image::Rgba<u8> {
+    use image::Rgba;
+    let sa = src[3] as f32 / 255.0;
+    let da = dst[3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a < 0.001 {
+        return Rgba([0, 0, 0, 0]);
+    }
+    let r = (src[0] as f32 * sa + dst[0] as f32 * da * (1.0 - sa)) / out_a;
+    let g = (src[1] as f32 * sa + dst[1] as f32 * da * (1.0 - sa)) / out_a;
+    let b = (src[2] as f32 * sa + dst[2] as f32 * da * (1.0 - sa)) / out_a;
+    Rgba([r as u8, g as u8, b as u8, (out_a * 255.0) as u8])
+}
+
+/// Get threshold color as [r, g, b] for a given percentage value.
+fn threshold_rgb(
+    pct: f32,
+    palette: settings::ColorPalette,
+    thresholds: &settings::ColorThresholds,
+) -> [u8; 3] {
+    let level = UsageLevel::from_percent(pct, thresholds);
+    let c = level.color(palette);
+    [c[0], c[1], c[2]]
+}
+
+/// Draw a threshold-colored line with area fill. Color changes per-pixel based on value.
+fn draw_threshold_line(
+    img: &mut image::RgbaImage,
+    values: &[f64], // raw percentage values per pixel column
+    line_y: &[f64], // y pixel positions per column
+    thickness: f64,
+    fill_alpha: f64,
+    bottom_y: f64,
+    palette: settings::ColorPalette,
+    thresholds: &settings::ColorThresholds,
+) {
+    use image::Rgba;
+    let w = img.width();
+    let h = img.height();
+
+    for px in 0..w {
+        let cy = line_y[px as usize];
+        let color = threshold_rgb(values[px as usize] as f32, palette, thresholds);
+
+        for py in 0..h {
+            let fy = py as f64;
+
+            let dist = (fy - cy).abs();
+            if dist < thickness {
+                let src = Rgba([color[0], color[1], color[2], 255]);
+                let dst = *img.get_pixel(px, py);
+                img.put_pixel(px, py, alpha_blend_chart(dst, src));
+            } else if dist < thickness + 1.0 {
+                let a = ((thickness + 1.0 - dist) * 255.0) as u8;
+                let src = Rgba([color[0], color[1], color[2], a]);
+                let dst = *img.get_pixel(px, py);
+                img.put_pixel(px, py, alpha_blend_chart(dst, src));
+            } else if fill_alpha > 0.0 && fy > cy + thickness && fy <= bottom_y {
+                let fill_span = bottom_y - (cy + thickness);
+                if fill_span > 0.0 {
+                    let t = (fy - (cy + thickness)) / fill_span;
+                    let a = ((1.0 - t) * fill_alpha) as u8;
+                    if a > 0 {
+                        let src = Rgba([color[0], color[1], color[2], a]);
+                        let dst = *img.get_pixel(px, py);
+                        img.put_pixel(px, py, alpha_blend_chart(dst, src));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render sparkline as raw RGBA pixels with threshold-based colors.
+fn render_sparkline(
+    session_pts: &[(i64, f32)],
+    weekly_pts: &[(i64, f32)],
+    show_session: bool,
+    show_weekly: bool,
+    palette: settings::ColorPalette,
+    thresholds: &settings::ColorThresholds,
+) -> Option<(RawIcon, f32, f32)> {
+    use image::RgbaImage;
+
+    let w = SPARKLINE_W;
+    let h = SPARKLINE_H;
+    let mut img = RgbaImage::new(w, h);
+
+    let min_t = session_pts.first()?.0 as f64;
+    let max_t = session_pts.last()?.0 as f64;
+    let t_range = (max_t - min_t).max(1.0);
+
+    let y_range = 100.0f64;
+    let margin = 4u32;
+    let draw_h = (h - margin * 2) as f64;
+    let bottom_y = (h - margin) as f64;
+    let line_thickness = 3.0f64;
+
+    let compute = |points: &[(i64, f32)]| -> (Vec<f64>, Vec<f64>) {
+        let values: Vec<f64> = (0..w)
+            .map(|px| interpolate_series(points, px, w, min_t, t_range))
+            .collect();
+        let ys: Vec<f64> = values
+            .iter()
+            .map(|&val| {
+                let y_frac = (val / y_range).clamp(0.0, 1.0);
+                margin as f64 + draw_h * (1.0 - y_frac)
+            })
+            .collect();
+        (values, ys)
+    };
+
+    // Draw weekly first (behind), then session on top
+    if show_weekly {
+        let (vals, ys) = compute(weekly_pts);
+        draw_threshold_line(
+            &mut img,
+            &vals,
+            &ys,
+            line_thickness,
+            30.0,
+            bottom_y,
+            palette,
+            thresholds,
+        );
+    }
+    if show_session {
+        let (vals, ys) = compute(session_pts);
+        draw_threshold_line(
+            &mut img,
+            &vals,
+            &ys,
+            line_thickness,
+            50.0,
+            bottom_y,
+            palette,
+            thresholds,
+        );
+    }
+
+    Some((
+        RawIcon {
+            rgba: img.into_raw(),
+            width: w,
+            height: h,
+        },
+        0.0,
+        100.0,
+    ))
+}
+
+/// Convert a RawIcon to an NSImage (retina, 2x).
+unsafe fn raw_to_nsimage(raw: &RawIcon) -> id {
+    let _pool = NSAutoreleasePool::new(nil);
+
+    let rep: id = msg_send![class!(NSBitmapImageRep), alloc];
+    let rep: id = msg_send![rep,
+        initWithBitmapDataPlanes: std::ptr::null_mut::<*mut u8>()
+        pixelsWide: raw.width as i64
+        pixelsHigh: raw.height as i64
+        bitsPerSample: 8i64
+        samplesPerPixel: 4i64
+        hasAlpha: true
+        isPlanar: false
+        colorSpaceName: NSString::alloc(nil).init_str("NSDeviceRGBColorSpace")
+        bytesPerRow: (raw.width * 4) as i64
+        bitsPerPixel: 32i64
+    ];
+
+    if rep == nil {
+        return nil;
+    }
+
+    // Copy pixel data into the rep's own buffer
+    let rep_data: *mut u8 = msg_send![rep, bitmapData];
+    if !rep_data.is_null() {
+        std::ptr::copy_nonoverlapping(raw.rgba.as_ptr(), rep_data, raw.rgba.len());
+    }
+
+    let img: id = msg_send![class!(NSImage), alloc];
+    let logical = NSSize::new(raw.width as f64 / 2.0, raw.height as f64 / 2.0);
+    let img: id = msg_send![img, initWithSize: logical];
+    let () = msg_send![img, addRepresentation: rep];
+    img
 }
 
 // ── Status info gathering ────────────────────────────────────────────
@@ -458,7 +1111,8 @@ unsafe fn make_progress_bar(pct: f32, w: f64, h: f64) -> id {
         let () = msg_send![fill, setWantsLayer: YES];
         let fl: id = msg_send![fill, layer];
 
-        let fill_color = bar_fill_color(pct);
+        let cfg = settings::get();
+        let fill_color = bar_fill_color(pct, cfg.color_palette, &cfg.color_thresholds);
         let cg_fill: id = msg_send![fill_color, CGColor];
         let () = msg_send![fl, setBackgroundColor: cg_fill];
         let () = msg_send![fl, setCornerRadius: CORNER_RADIUS];
@@ -479,15 +1133,25 @@ unsafe fn secondary_color() -> id {
     NSColor_rgba(0.55, 0.55, 0.58, 1.0)
 }
 
-unsafe fn bar_fill_color(pct: f32) -> id {
-    if pct >= 95.0 {
-        NSColor_rgba(1.0, 0.23, 0.19, 1.0) // red
-    } else if pct >= 80.0 {
-        NSColor_rgba(1.0, 0.58, 0.0, 1.0) // orange
-    } else if pct >= 50.0 {
-        NSColor_rgba(1.0, 0.80, 0.0, 1.0) // yellow
-    } else {
-        NSColor_rgba(0.20, 0.78, 0.35, 1.0) // green
+unsafe fn bar_fill_color(
+    pct: f32,
+    palette: settings::ColorPalette,
+    thresholds: &settings::ColorThresholds,
+) -> id {
+    let level = UsageLevel::from_percent(pct, thresholds);
+    match palette {
+        settings::ColorPalette::Default => match level {
+            UsageLevel::Low => NSColor_rgba(0.20, 0.78, 0.35, 1.0), // green
+            UsageLevel::Medium => NSColor_rgba(1.0, 0.80, 0.0, 1.0), // yellow
+            UsageLevel::High => NSColor_rgba(1.0, 0.58, 0.0, 1.0),  // orange
+            UsageLevel::Critical => NSColor_rgba(1.0, 0.23, 0.19, 1.0), // red
+        },
+        settings::ColorPalette::Monochrome => match level {
+            UsageLevel::Low => NSColor_rgba(0.55, 0.55, 0.55, 1.0),
+            UsageLevel::Medium => NSColor_rgba(0.65, 0.65, 0.65, 1.0),
+            UsageLevel::High => NSColor_rgba(0.75, 0.75, 0.75, 1.0),
+            UsageLevel::Critical => NSColor_rgba(0.85, 0.85, 0.85, 1.0),
+        },
     }
 }
 
@@ -526,6 +1190,312 @@ unsafe fn separator() -> id {
     msg_send![class!(NSMenuItem), separatorItem]
 }
 
+/// Build the Settings submenu with style and section visibility options.
+unsafe fn settings_submenu_item(cfg: &settings::Settings) -> id {
+    let handler = MENU_HANDLER.get().map(|h| h.0).unwrap_or(nil);
+
+    let sub: id = msg_send![class!(NSMenu), new];
+
+    // ── Icon Type radio group ──
+    let icon_header: id = msg_send![class!(NSMenuItem), alloc];
+    let icon_header: id = msg_send![icon_header,
+        initWithTitle: NSString::alloc(nil).init_str("Icon Type")
+        action: cocoa::base::nil
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![icon_header, setEnabled: NO];
+    let () = msg_send![sub, addItem: icon_header];
+
+    for (i, icon_type) in settings::IconType::ALL.iter().enumerate() {
+        let item: id = msg_send![class!(NSMenuItem), alloc];
+        let item: id = msg_send![item,
+            initWithTitle: NSString::alloc(nil).init_str(icon_type.label())
+            action: sel!(setIconTypeAction:)
+            keyEquivalent: NSString::alloc(nil).init_str("")
+        ];
+        let () = msg_send![item, setTarget: handler];
+        let () = msg_send![item, setTag: i as isize];
+        if *icon_type == cfg.icon_type {
+            let () = msg_send![item, setState: 1i64]; // NSControlStateValueOn
+        }
+        let () = msg_send![sub, addItem: item];
+    }
+
+    let () = msg_send![sub, addItem: separator()];
+
+    // ── Show Usage Categories toggles ──
+    let sections_header: id = msg_send![class!(NSMenuItem), alloc];
+    let sections_header: id = msg_send![sections_header,
+        initWithTitle: NSString::alloc(nil).init_str("Show Usage Categories")
+        action: cocoa::base::nil
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![sections_header, setEnabled: NO];
+    let () = msg_send![sub, addItem: sections_header];
+
+    let sections = [
+        ("Session", cfg.show_session, 0isize),
+        ("Weekly", cfg.show_weekly, 1),
+        ("Sonnet", cfg.show_sonnet, 2),
+        ("Extra Usage", cfg.show_extra, 3),
+    ];
+
+    for (label, enabled, tag) in &sections {
+        let item: id = msg_send![class!(NSMenuItem), alloc];
+        let item: id = msg_send![item,
+            initWithTitle: NSString::alloc(nil).init_str(label)
+            action: sel!(toggleSectionAction:)
+            keyEquivalent: NSString::alloc(nil).init_str("")
+        ];
+        let () = msg_send![item, setTarget: handler];
+        let () = msg_send![item, setTag: *tag];
+        if *enabled {
+            let () = msg_send![item, setState: 1i64]; // NSControlStateValueOn
+        }
+        let () = msg_send![sub, addItem: item];
+    }
+
+    let () = msg_send![sub, addItem: separator()];
+
+    // ── Show Icon toggle ──
+    let icon_toggle: id = msg_send![class!(NSMenuItem), alloc];
+    let icon_toggle: id = msg_send![icon_toggle,
+        initWithTitle: NSString::alloc(nil).init_str("Show Icon")
+        action: sel!(toggleIconAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![icon_toggle, setTarget: handler];
+    if cfg.show_icon {
+        let () = msg_send![icon_toggle, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: icon_toggle];
+
+    // ── Show Label toggle ──
+    let label_toggle: id = msg_send![class!(NSMenuItem), alloc];
+    let label_toggle: id = msg_send![label_toggle,
+        initWithTitle: NSString::alloc(nil).init_str("Show Label")
+        action: sel!(toggleLabelAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![label_toggle, setTarget: handler];
+    if cfg.show_label {
+        let () = msg_send![label_toggle, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: label_toggle];
+
+    // ── Show Number toggle ──
+    let num_toggle: id = msg_send![class!(NSMenuItem), alloc];
+    let num_toggle: id = msg_send![num_toggle,
+        initWithTitle: NSString::alloc(nil).init_str("Show Number")
+        action: sel!(toggleNumberAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![num_toggle, setTarget: handler];
+    if cfg.show_number {
+        let () = msg_send![num_toggle, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: num_toggle];
+
+    let () = msg_send![sub, addItem: separator()];
+
+    // ── Monochrome toggle ──
+    let mono_item: id = msg_send![class!(NSMenuItem), alloc];
+    let mono_item: id = msg_send![mono_item,
+        initWithTitle: NSString::alloc(nil).init_str("Monochrome")
+        action: sel!(toggleMonochromeAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![mono_item, setTarget: handler];
+    if cfg.color_palette == settings::ColorPalette::Monochrome {
+        let () = msg_send![mono_item, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: mono_item];
+
+    // ── Icons Colored toggle ──
+    let icons_colored_item: id = msg_send![class!(NSMenuItem), alloc];
+    let icons_colored_item: id = msg_send![icons_colored_item,
+        initWithTitle: NSString::alloc(nil).init_str("Icons Colored")
+        action: sel!(toggleIconsColoredAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![icons_colored_item, setTarget: handler];
+    if cfg.icons_colored {
+        let () = msg_send![icons_colored_item, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: icons_colored_item];
+
+    let () = msg_send![sub, addItem: separator()];
+
+    // ── Usage Thresholds preset group ──
+    let thresh_header: id = msg_send![class!(NSMenuItem), alloc];
+    let thresh_header: id = msg_send![thresh_header,
+        initWithTitle: NSString::alloc(nil).init_str("Usage Thresholds")
+        action: cocoa::base::nil
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![thresh_header, setEnabled: NO];
+    let () = msg_send![sub, addItem: thresh_header];
+
+    for (i, (label, preset)) in settings::ColorThresholds::PRESETS.iter().enumerate() {
+        let item: id = msg_send![class!(NSMenuItem), alloc];
+        let item: id = msg_send![item,
+            initWithTitle: NSString::alloc(nil).init_str(label)
+            action: sel!(setThresholdsAction:)
+            keyEquivalent: NSString::alloc(nil).init_str("")
+        ];
+        let () = msg_send![item, setTarget: handler];
+        let () = msg_send![item, setTag: i as isize];
+        if cfg.color_thresholds == *preset {
+            let () = msg_send![item, setState: 1i64];
+        }
+        let () = msg_send![sub, addItem: item];
+    }
+
+    let () = msg_send![sub, addItem: separator()];
+
+    // ── Auto Refresh Interval radio group ──
+    let interval_header: id = msg_send![class!(NSMenuItem), alloc];
+    let interval_header: id = msg_send![interval_header,
+        initWithTitle: NSString::alloc(nil).init_str("Auto Refresh Interval")
+        action: cocoa::base::nil
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![interval_header, setEnabled: NO];
+    let () = msg_send![sub, addItem: interval_header];
+
+    for (secs, label) in &settings::RefreshInterval::OPTIONS {
+        let item: id = msg_send![class!(NSMenuItem), alloc];
+        let item: id = msg_send![item,
+            initWithTitle: NSString::alloc(nil).init_str(label)
+            action: sel!(setRefreshIntervalAction:)
+            keyEquivalent: NSString::alloc(nil).init_str("")
+        ];
+        let () = msg_send![item, setTarget: handler];
+        let () = msg_send![item, setTag: *secs as isize];
+        if cfg.refresh_interval.0 == *secs {
+            let () = msg_send![item, setState: 1i64];
+        }
+        let () = msg_send![sub, addItem: item];
+    }
+
+    let () = msg_send![sub, addItem: separator()];
+
+    // ── Notifications ──
+    let notify_item: id = msg_send![class!(NSMenuItem), alloc];
+    let notify_item: id = msg_send![notify_item,
+        initWithTitle: NSString::alloc(nil).init_str("Notifications")
+        action: sel!(toggleNotifyAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![notify_item, setTarget: handler];
+    if cfg.notify_enabled {
+        let () = msg_send![notify_item, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: notify_item];
+
+    // Per-section notification threshold submenus
+    if cfg.notify_enabled {
+        // Session threshold
+        let session_sub: id = msg_send![class!(NSMenu), new];
+        for threshold in &[50u32, 70, 80, 90, 95] {
+            let item: id = msg_send![class!(NSMenuItem), alloc];
+            let label = format!("{}%", threshold);
+            let item: id = msg_send![item,
+                initWithTitle: NSString::alloc(nil).init_str(&label)
+                action: sel!(setSessionThresholdAction:)
+                keyEquivalent: NSString::alloc(nil).init_str("")
+            ];
+            let () = msg_send![item, setTarget: handler];
+            let () = msg_send![item, setTag: *threshold as isize];
+            if cfg.notify_session_threshold == *threshold {
+                let () = msg_send![item, setState: 1i64];
+            }
+            let () = msg_send![session_sub, addItem: item];
+        }
+        let session_parent: id = msg_send![class!(NSMenuItem), alloc];
+        let session_parent: id = msg_send![session_parent,
+            initWithTitle: NSString::alloc(nil).init_str(&format!("Session alert at {}%", cfg.notify_session_threshold))
+            action: cocoa::base::nil
+            keyEquivalent: NSString::alloc(nil).init_str("")
+        ];
+        let () = msg_send![session_parent, setSubmenu: session_sub];
+        let () = msg_send![sub, addItem: session_parent];
+
+        // Weekly threshold
+        let weekly_sub: id = msg_send![class!(NSMenu), new];
+        for threshold in &[50u32, 70, 80, 90, 95] {
+            let item: id = msg_send![class!(NSMenuItem), alloc];
+            let label = format!("{}%", threshold);
+            let item: id = msg_send![item,
+                initWithTitle: NSString::alloc(nil).init_str(&label)
+                action: sel!(setWeeklyThresholdAction:)
+                keyEquivalent: NSString::alloc(nil).init_str("")
+            ];
+            let () = msg_send![item, setTarget: handler];
+            let () = msg_send![item, setTag: *threshold as isize];
+            if cfg.notify_weekly_threshold == *threshold {
+                let () = msg_send![item, setState: 1i64];
+            }
+            let () = msg_send![weekly_sub, addItem: item];
+        }
+        let weekly_parent: id = msg_send![class!(NSMenuItem), alloc];
+        let weekly_parent: id = msg_send![weekly_parent,
+            initWithTitle: NSString::alloc(nil).init_str(&format!("Weekly alert at {}%", cfg.notify_weekly_threshold))
+            action: cocoa::base::nil
+            keyEquivalent: NSString::alloc(nil).init_str("")
+        ];
+        let () = msg_send![weekly_parent, setSubmenu: weekly_sub];
+        let () = msg_send![sub, addItem: weekly_parent];
+    }
+
+    let () = msg_send![sub, addItem: separator()];
+
+    // ── Launch at Login ──
+    let login_item: id = msg_send![class!(NSMenuItem), alloc];
+    let login_item: id = msg_send![login_item,
+        initWithTitle: NSString::alloc(nil).init_str("Launch at Login")
+        action: sel!(toggleLaunchAtLoginAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![login_item, setTarget: handler];
+    if cfg.launch_at_login {
+        let () = msg_send![login_item, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: login_item];
+
+    // ── Create the parent item with gear icon ──
+    let parent: id = msg_send![class!(NSMenuItem), alloc];
+    let parent: id = msg_send![parent,
+        initWithTitle: NSString::alloc(nil).init_str("Settings")
+        action: cocoa::base::nil
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+
+    // SF Symbol gear icon (macOS 11+)
+    let gear_name = NSString::alloc(nil).init_str("gearshape");
+    let gear_img: id = msg_send![class!(NSImage), imageWithSystemSymbolName: gear_name accessibilityDescription: nil];
+    if gear_img != nil {
+        let () = msg_send![parent, setImage: gear_img];
+    }
+
+    let () = msg_send![parent, setSubmenu: sub];
+    parent
+}
+
+unsafe fn refresh_item() -> id {
+    let s = NSString::alloc(nil).init_str("Refresh");
+    let item: id = msg_send![class!(NSMenuItem), alloc];
+    let item: id = msg_send![item,
+        initWithTitle: s
+        action: sel!(refreshAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("r")
+    ];
+    if let Some(handler) = MENU_HANDLER.get() {
+        let () = msg_send![item, setTarget: handler.0];
+    }
+    item
+}
+
 unsafe fn quit_item() -> id {
     let s = NSString::alloc(nil).init_str("Quit");
     let item: id = msg_send![class!(NSMenuItem), alloc];
@@ -538,15 +1508,12 @@ unsafe fn quit_item() -> id {
 }
 
 /// Create NSImage from raw RGBA pixel data and set on button.
-unsafe fn set_button_image(button: id, raw: &RawIcon) {
+unsafe fn set_button_image(button: id, raw: &RawIcon, template: bool) {
     let _pool = NSAutoreleasePool::new(nil);
 
     let rep: id = msg_send![class!(NSBitmapImageRep), alloc];
-    let planes_ptr = raw.rgba.as_ptr() as *mut u8;
-    let mut planes = [planes_ptr];
-
     let rep: id = msg_send![rep,
-        initWithBitmapDataPlanes: planes.as_mut_ptr()
+        initWithBitmapDataPlanes: std::ptr::null_mut::<*mut u8>()
         pixelsWide: raw.width as i64
         pixelsHigh: raw.height as i64
         bitsPerSample: 8i64
@@ -562,12 +1529,134 @@ unsafe fn set_button_image(button: id, raw: &RawIcon) {
         return;
     }
 
+    // Copy pixel data into the rep's own buffer
+    let rep_data: *mut u8 = msg_send![rep, bitmapData];
+    if !rep_data.is_null() {
+        std::ptr::copy_nonoverlapping(raw.rgba.as_ptr(), rep_data, raw.rgba.len());
+    }
+
     let img: id = msg_send![class!(NSImage), alloc];
     let logical = NSSize::new(raw.width as f64 / 2.0, raw.height as f64 / 2.0);
     let img: id = msg_send![img, initWithSize: logical];
     let () = msg_send![img, addRepresentation: rep];
-    let () = msg_send![img, setTemplate: false];
+    let () = msg_send![img, setTemplate: template];
     let () = msg_send![button, setImage: img];
+}
+
+// ── Notifications ────────────────────────────────────────────────────
+
+/// Track whether we already sent a notification for the current usage window
+/// to avoid spamming. Reset when usage drops below threshold.
+static NOTIFIED_SESSION: AtomicBool = AtomicBool::new(false);
+static NOTIFIED_WEEKLY: AtomicBool = AtomicBool::new(false);
+
+fn check_and_notify(usage: &ParsedUsage) {
+    let cfg = settings::get();
+    if !cfg.notify_enabled {
+        return;
+    }
+
+    // Session (independent threshold)
+    let session_threshold = cfg.notify_session_threshold as f32;
+    if usage.session_percent >= session_threshold {
+        if !NOTIFIED_SESSION.swap(true, Ordering::Relaxed) {
+            send_notification(
+                &format!("Session usage at {:.0}%", usage.session_percent),
+                &format!(
+                    "{}",
+                    usage
+                        .session_reset
+                        .as_deref()
+                        .map(|r| format!("Resets {}", format_reset(r)))
+                        .unwrap_or_default()
+                ),
+            );
+        }
+    } else {
+        NOTIFIED_SESSION.store(false, Ordering::Relaxed);
+    }
+
+    // Weekly (independent threshold)
+    let weekly_threshold = cfg.notify_weekly_threshold as f32;
+    if usage.weekly_percent >= weekly_threshold {
+        if !NOTIFIED_WEEKLY.swap(true, Ordering::Relaxed) {
+            send_notification(
+                &format!("Weekly usage at {:.0}%", usage.weekly_percent),
+                &format!(
+                    "{}",
+                    usage
+                        .weekly_reset
+                        .as_deref()
+                        .map(|r| format!("Resets {}", format_reset(r)))
+                        .unwrap_or_default()
+                ),
+            );
+        }
+    } else {
+        NOTIFIED_WEEKLY.store(false, Ordering::Relaxed);
+    }
+}
+
+fn send_notification(title: &str, body: &str) {
+    unsafe {
+        let center: id = msg_send![
+            class!(NSUserNotificationCenter),
+            defaultUserNotificationCenter
+        ];
+        let notif: id = msg_send![class!(NSUserNotification), new];
+        let () = msg_send![notif, setTitle: NSString::alloc(nil).init_str(title)];
+        let () = msg_send![notif, setInformativeText: NSString::alloc(nil).init_str(body)];
+        let () = msg_send![notif, setSoundName: NSString::alloc(nil).init_str("default")];
+        let () = msg_send![center, deliverNotification: notif];
+    }
+    tracing::info!("Notification sent: {}", title);
+}
+
+// ── Launch at Login ──────────────────────────────────────────────────
+
+const LAUNCH_AGENT_LABEL: &str = "com.vibe-usage.launcher";
+
+fn launch_agent_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", LAUNCH_AGENT_LABEL))
+}
+
+fn set_launch_at_login(enable: bool) {
+    let path = launch_agent_path();
+    if enable {
+        // Find current binary path
+        let exe = std::env::current_exe().unwrap_or_default();
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"#,
+            LAUNCH_AGENT_LABEL,
+            exe.display()
+        );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&path, plist).ok();
+        tracing::info!("Launch agent installed at {:?}", path);
+    } else {
+        std::fs::remove_file(&path).ok();
+        tracing::info!("Launch agent removed from {:?}", path);
+    }
 }
 
 fn format_reset(iso: &str) -> String {

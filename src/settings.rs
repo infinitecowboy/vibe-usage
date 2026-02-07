@@ -1,0 +1,286 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+static SETTINGS: OnceLock<Mutex<Settings>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IconType {
+    Dot,        // colored circle (session level)
+    SignalBars, // 4 ascending bars (weekly quartiles)
+    MiniBars,   // vertical fill bars (one per visible session)
+    DotGrid,    // 2x4 dot grid with S/W labels
+}
+
+impl IconType {
+    pub const ALL: [IconType; 4] = [
+        IconType::Dot,
+        IconType::SignalBars,
+        IconType::MiniBars,
+        IconType::DotGrid,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Dot => "Dot",
+            Self::SignalBars => "Signal Bars",
+            Self::MiniBars => "Mini Bars",
+            Self::DotGrid => "Dot Grid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorPalette {
+    Default,
+    Monochrome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorThresholds {
+    pub warning: u32,  // yellow/medium threshold
+    pub high: u32,     // orange/high threshold
+    pub critical: u32, // red/critical threshold
+}
+
+impl Default for ColorThresholds {
+    fn default() -> Self {
+        Self {
+            warning: 50,
+            high: 75,
+            critical: 90,
+        }
+    }
+}
+
+impl ColorThresholds {
+    pub const PRESETS: [(&'static str, ColorThresholds); 2] = [
+        (
+            "Default (50/75/90)",
+            ColorThresholds {
+                warning: 50,
+                high: 75,
+                critical: 90,
+            },
+        ),
+        (
+            "Conservative (30/60/90)",
+            ColorThresholds {
+                warning: 30,
+                high: 60,
+                critical: 90,
+            },
+        ),
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshInterval(pub u64);
+
+impl RefreshInterval {
+    pub const OPTIONS: [(u64, &'static str); 4] = [
+        (60, "1 min"),
+        (120, "2 min"),
+        (300, "5 min"),
+        (600, "10 min"),
+    ];
+
+    pub fn label(&self) -> &'static str {
+        Self::OPTIONS
+            .iter()
+            .find(|(v, _)| *v == self.0)
+            .map(|(_, l)| *l)
+            .unwrap_or("5 min")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default = "default_icon_type")]
+    pub icon_type: IconType,
+    #[serde(default = "default_true")]
+    pub show_icon: bool,
+    #[serde(default = "default_true")]
+    pub show_label: bool,
+    #[serde(default = "default_true")]
+    pub show_number: bool,
+    pub show_session: bool,
+    pub show_weekly: bool,
+    pub show_sonnet: bool,
+    pub show_extra: bool,
+    #[serde(default = "default_notify_enabled")]
+    pub notify_enabled: bool,
+    #[serde(default = "default_notify_threshold")]
+    pub notify_session_threshold: u32,
+    #[serde(default = "default_notify_threshold")]
+    pub notify_weekly_threshold: u32,
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval: RefreshInterval,
+    #[serde(default)]
+    pub launch_at_login: bool,
+    #[serde(default = "default_color_palette")]
+    pub color_palette: ColorPalette,
+    #[serde(default)]
+    pub color_thresholds: ColorThresholds,
+    #[serde(default = "default_true")]
+    pub icons_colored: bool,
+}
+
+fn default_icon_type() -> IconType {
+    IconType::Dot
+}
+fn default_notify_enabled() -> bool {
+    false
+}
+fn default_notify_threshold() -> u32 {
+    80
+}
+fn default_refresh_interval() -> RefreshInterval {
+    RefreshInterval(300)
+}
+fn default_color_palette() -> ColorPalette {
+    ColorPalette::Default
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            icon_type: IconType::Dot,
+            show_icon: true,
+            show_label: true,
+            show_number: true,
+            show_session: true,
+            show_weekly: true,
+            show_sonnet: true,
+            show_extra: true,
+            notify_enabled: false,
+            notify_session_threshold: 80,
+            notify_weekly_threshold: 80,
+            refresh_interval: RefreshInterval(300),
+            launch_at_login: false,
+            color_palette: ColorPalette::Default,
+            color_thresholds: ColorThresholds::default(),
+            icons_colored: true,
+        }
+    }
+}
+
+fn settings_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dir = PathBuf::from(home).join(".vibe-usage");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("settings.json")
+}
+
+pub fn load() -> Settings {
+    let path = settings_path();
+    let json_str = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Settings::default(),
+    };
+
+    // Try parsing directly with new format
+    if let Ok(s) = serde_json::from_str::<Settings>(&json_str) {
+        return s;
+    }
+
+    // Migration: detect old fields and convert
+    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+        let mut changed = false;
+        if let Some(old_style) = val
+            .get("menubar_style")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        {
+            let (icon_type, show_icon, show_num) = match old_style.as_str() {
+                "detailed" => ("dot", true, true),
+                "compact" => ("dot", true, false),
+                "text_only" => ("dot", false, true),
+                "icon_only" => ("dot", true, false),
+                "mini_bars" => ("mini_bars", true, false),
+                "dot_grid" => ("dot_grid", true, false),
+                _ => ("dot", true, true),
+            };
+            if let Some(obj) = val.as_object_mut() {
+                obj.remove("menubar_style");
+                obj.insert(
+                    "icon_type".into(),
+                    serde_json::Value::String(icon_type.into()),
+                );
+                obj.insert("show_icon".into(), serde_json::Value::Bool(show_icon));
+                obj.insert("show_number".into(), serde_json::Value::Bool(show_num));
+            }
+            changed = true;
+        }
+        // Migrate old show_percent -> show_number
+        if let Some(obj) = val.as_object_mut() {
+            if let Some(sp) = obj.remove("show_percent") {
+                obj.insert("show_number".into(), sp);
+                changed = true;
+            }
+        }
+        // Remove old fields that no longer exist
+        if let Some(obj) = val.as_object_mut() {
+            for key in &["hotkey_enabled", "chart_style"] {
+                if obj.remove(*key).is_some() {
+                    changed = true;
+                }
+            }
+            // Migrate icon_type "none" -> "dot"
+            if obj.get("icon_type").and_then(|v| v.as_str()) == Some("none") {
+                obj.insert("icon_type".into(), serde_json::Value::String("dot".into()));
+                changed = true;
+            }
+            // Migrate colorblind palette -> default
+            if obj.get("color_palette").and_then(|v| v.as_str()) == Some("colorblind") {
+                obj.insert(
+                    "color_palette".into(),
+                    serde_json::Value::String("default".into()),
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            if let Ok(migrated) = serde_json::from_value::<Settings>(val) {
+                save(&migrated);
+                return migrated;
+            }
+        }
+    }
+
+    Settings::default()
+}
+
+fn save(settings: &Settings) {
+    let path = settings_path();
+    if let Ok(json) = serde_json::to_string_pretty(settings) {
+        std::fs::write(&path, json).ok();
+    }
+}
+
+/// Initialize the global settings. Call once at startup.
+pub fn init() {
+    SETTINGS.get_or_init(|| Mutex::new(load()));
+}
+
+/// Get a clone of the current settings.
+pub fn get() -> Settings {
+    SETTINGS
+        .get()
+        .map(|m| m.lock().unwrap().clone())
+        .unwrap_or_default()
+}
+
+/// Update settings with a closure, then persist to disk.
+pub fn update(f: impl FnOnce(&mut Settings)) {
+    if let Some(m) = SETTINGS.get() {
+        let mut s = m.lock().unwrap();
+        f(&mut s);
+        save(&s);
+    }
+}

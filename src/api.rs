@@ -5,7 +5,6 @@ use serde::Deserialize;
 #[derive(Clone)]
 pub struct UsageClient {
     client: Client,
-    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,18 +42,17 @@ pub struct ParsedUsage {
 }
 
 impl UsageClient {
-    pub fn new(token: String) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         Ok(Self {
             client: Client::builder().user_agent("claude-code/2.1.31").build()?,
-            token,
         })
     }
 
-    pub async fn fetch_usage(&self) -> Result<UsageResponse> {
+    pub async fn fetch_usage(&self, token: &str) -> Result<UsageResponse> {
         let response = self
             .client
             .get("https://api.anthropic.com/api/oauth/usage")
-            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Authorization", format!("Bearer {}", token))
             .header("anthropic-beta", "oauth-2025-04-20")
             .send()
             .await

@@ -1,7 +1,9 @@
 mod api;
+mod history;
 mod icons;
 mod keychain;
 mod menubar;
+pub mod settings;
 
 use anyhow::Result;
 
