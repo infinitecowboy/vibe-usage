@@ -103,8 +103,6 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub show_icon: bool,
     #[serde(default = "default_true")]
-    pub show_label: bool,
-    #[serde(default = "default_true")]
     pub show_number: bool,
     pub show_session: bool,
     pub show_weekly: bool,
@@ -152,7 +150,6 @@ impl Default for Settings {
         Self {
             icon_type: IconType::Dot,
             show_icon: true,
-            show_label: true,
             show_number: true,
             show_session: true,
             show_weekly: true,
@@ -226,7 +223,7 @@ pub fn load() -> Settings {
         }
         // Remove old fields that no longer exist
         if let Some(obj) = val.as_object_mut() {
-            for key in &["hotkey_enabled", "chart_style"] {
+            for key in &["hotkey_enabled", "chart_style", "show_label"] {
                 if obj.remove(*key).is_some() {
                     changed = true;
                 }

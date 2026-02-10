@@ -1,8 +1,6 @@
 use crate::api::ParsedUsage;
 use crate::settings::{ColorPalette, ColorThresholds, IconType};
-use ab_glyph::{FontRef, PxScale};
 use image::{Rgba, RgbaImage};
-use imageproc::drawing::draw_text_mut;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UsageLevel {
@@ -47,23 +45,16 @@ fn gray_color() -> Rgba<u8> {
     Rgba([120, 120, 125, 180])
 }
 
-fn text_color(palette: ColorPalette) -> Rgba<u8> {
-    match palette {
-        ColorPalette::Monochrome => Rgba([0, 0, 0, 255]),
-        _ => Rgba([255, 255, 255, 255]),
-    }
-}
-
 /// Whether the icon should be set as a template image (adapts to light/dark).
 /// When icons_colored is true, we have mixed colors so template mode won't work.
 pub fn is_template(palette: ColorPalette, icons_colored: bool) -> bool {
     matches!(palette, ColorPalette::Monochrome) && !icons_colored
 }
 
-const FONT_DATA: &[u8] = include_bytes!("/System/Library/Fonts/Geneva.ttf");
 const ICON_H: u32 = 44;
 
 /// Raw icon data for direct NSImage creation.
+#[derive(Debug, Clone)]
 pub struct RawIcon {
     pub rgba: Vec<u8>,
     pub width: u32,
@@ -77,32 +68,40 @@ pub struct SectionVisibility {
     pub weekly: bool,
 }
 
-// ── Composable icon generator ────────────────────────────────────────
+/// Per-section data exposed to the caller for building native text.
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub label: &'static str, // "S" or "W"
+    pub pct: f32,
+    pub level: UsageLevel,
+    pub icon: RawIcon,
+}
 
-/// Per-section data for rendering.
+/// Result of indicator generation: per-section icons + metadata.
+pub struct IndicatorResult {
+    pub sections: Vec<SectionInfo>,
+}
+
+// ── Composable indicator generator ───────────────────────────────────
+
+/// Per-section data for internal rendering.
 struct SectionData {
-    label: &'static str, // "S" or "W"
+    label: &'static str,
     pct: f32,
     level: UsageLevel,
 }
 
-/// Generate status bar icon as raw RGBA pixels.
-/// Layout: for each visible section, draw [icon][number] pair.
-/// e.g. with Dot + show_number: [S-dot][S:42%] [W-dot][W:78%]
-pub fn generate_status_icon_raw(
+/// Generate per-section indicator images (no text). Text is rendered natively
+/// by the caller via NSAttributedString with inline image attachments.
+pub fn generate_indicator_image(
     level: UsageLevel,
     usage: Option<&ParsedUsage>,
     icon_type: IconType,
-    show_icon: bool,
-    show_label: bool,
-    show_number: bool,
     palette: ColorPalette,
     thresholds: &ColorThresholds,
     vis: SectionVisibility,
     icons_colored: bool,
-) -> anyhow::Result<RawIcon> {
-    // When icons_colored is on, graphics use Default (colored) palette,
-    // text/labels use the actual palette setting.
+) -> anyhow::Result<IndicatorResult> {
     let graphic_palette = if icons_colored {
         ColorPalette::Default
     } else {
@@ -111,83 +110,34 @@ pub fn generate_status_icon_raw(
 
     let sections = build_sections(level, usage, thresholds, vis);
 
-    let char_w = 16i32; // ~16px per char at PxScale 28 (accounts for wider chars like %)
-    let section_gap = 10i32; // gap between section pairs
-    let icon_num_gap = 3i32; // gap between icon and number within a section
-
-    // Measure total width
-    let mut total_w = 0i32;
-    for (i, sec) in sections.iter().enumerate() {
-        if i > 0 {
-            total_w += section_gap;
-        }
-        let iw = if show_icon {
-            section_icon_width(icon_type, sec) as i32
-        } else {
-            0
-        };
-        let tw = if show_number {
-            let text = format_section_text(sec, show_label);
-            text.len() as i32 * char_w
-        } else {
-            0
-        };
-        let gap = if iw > 0 && tw > 0 { icon_num_gap } else { 0 };
-        total_w += iw + gap + tw;
-    }
-
-    // Fallback minimum + right padding so text doesn't clip
-    if total_w < 10 {
-        total_w = 20;
-    }
-    total_w += 6;
-
-    let mut img = RgbaImage::new(total_w as u32, ICON_H);
-
-    // Draw each section pair
-    let font =
-        FontRef::try_from_slice(FONT_DATA).map_err(|e| anyhow::anyhow!("Font error: {}", e))?;
-    let scale = PxScale::from(28.0);
-    let text_y = 8i32;
-
-    let mut x = 0i32;
-    for (i, sec) in sections.iter().enumerate() {
-        if i > 0 {
-            x += section_gap;
-        }
-
-        // Draw icon for this section (uses graphic_palette for colors)
-        if show_icon {
-            let iw = section_icon_width(icon_type, sec) as i32;
-            draw_section_icon(
-                &mut img,
-                icon_type,
-                sec,
-                x as u32,
-                graphic_palette,
-                palette,
-                &font,
-            )?;
-            x += iw;
-            if show_number {
-                x += icon_num_gap;
+    let section_infos = sections
+        .iter()
+        .map(|sec| {
+            let icon = render_section_icon(icon_type, sec, graphic_palette);
+            SectionInfo {
+                label: sec.label,
+                pct: sec.pct,
+                level: sec.level,
+                icon,
             }
-        }
+        })
+        .collect();
 
-        // Draw number/label for this section (uses text palette)
-        if show_number {
-            let text = format_section_text(sec, show_label);
-            let color = text_color(palette);
-            draw_text_mut(&mut img, color, x, text_y, scale, &font, &text);
-            x += text.len() as i32 * char_w;
-        }
-    }
-
-    Ok(RawIcon {
-        rgba: img.into_raw(),
-        width: total_w as u32,
-        height: ICON_H,
+    Ok(IndicatorResult {
+        sections: section_infos,
     })
+}
+
+/// Render a single section's indicator graphic as a standalone image.
+fn render_section_icon(icon_type: IconType, sec: &SectionData, palette: ColorPalette) -> RawIcon {
+    let w = section_icon_width(icon_type, sec);
+    let mut img = RgbaImage::new(w, ICON_H);
+    draw_section_icon(&mut img, icon_type, sec, 0, palette);
+    RawIcon {
+        rgba: img.into_raw(),
+        width: w,
+        height: ICON_H,
+    }
 }
 
 /// Build per-section data from usage.
@@ -230,22 +180,13 @@ fn build_sections(
     sections
 }
 
-/// Format the text for a section: "S:42%" with label, "42%" without.
-fn format_section_text(sec: &SectionData, show_label: bool) -> String {
-    if show_label {
-        format!("{}:{:.0}%", sec.label, sec.pct)
-    } else {
-        format!("{:.0}%", sec.pct)
-    }
-}
-
 /// Width of a single section's icon graphic.
 fn section_icon_width(icon_type: IconType, _sec: &SectionData) -> u32 {
     match icon_type {
-        IconType::Dot => 18,        // single dot for this section
-        IconType::SignalBars => 30, // 4 bars: 4*6 + 3*2
-        IconType::MiniBars => 14,   // 8px bar + padding
-        IconType::DotGrid => 54,    // label(14) + 4 dots(4*10)
+        IconType::Dot => 18,
+        IconType::SignalBars => 30,
+        IconType::MiniBars => 14,
+        IconType::DotGrid => 40, // 4 dots only (no label text)
     }
 }
 
@@ -256,9 +197,7 @@ fn draw_section_icon(
     sec: &SectionData,
     x: u32,
     palette: ColorPalette,
-    text_palette: ColorPalette,
-    font: &FontRef,
-) -> anyhow::Result<()> {
+) {
     match icon_type {
         IconType::Dot => {
             let color = sec.level.color(palette);
@@ -273,10 +212,9 @@ fn draw_section_icon(
             draw_mini_bar_single(img, sec, x, palette);
         }
         IconType::DotGrid => {
-            draw_dot_row(img, sec, x, palette, text_palette, font)?;
+            draw_dot_row(img, sec, x, palette);
         }
     }
-    Ok(())
 }
 
 // ── Per-section drawing helpers ──────────────────────────────────────
@@ -349,39 +287,18 @@ fn draw_mini_bar_single(
     }
 }
 
-/// Draw a single row of 4 dots for a section at the given x offset.
-fn draw_dot_row(
-    img: &mut RgbaImage,
-    sec: &SectionData,
-    start_x: u32,
-    palette: ColorPalette,
-    text_palette: ColorPalette,
-    font: &FontRef,
-) -> anyhow::Result<()> {
-    let label_scale = PxScale::from(22.0);
+/// Draw a row of 4 dots for a section at the given x offset (no text label).
+fn draw_dot_row(img: &mut RgbaImage, sec: &SectionData, start_x: u32, palette: ColorPalette) {
     let track = Rgba([120, 120, 125, 60]);
-    let label_color = text_color(text_palette);
     let dot_r = 5.0f32;
     let cols = 4i32;
     let gap_x = 10.0f32;
-    let label_w = 14.0f32;
 
     let row_y = img.height() as f32 / 2.0;
     let filled = ((sec.pct / 25.0).ceil() as i32).min(4).max(0);
 
-    draw_text_mut(
-        img,
-        label_color,
-        start_x as i32 + 1,
-        11,
-        label_scale,
-        font,
-        sec.label,
-    );
-
-    let dots_start = start_x as f32 + label_w;
     for col in 0..cols {
-        let cx = dots_start + col as f32 * gap_x;
+        let cx = start_x as f32 + col as f32 * gap_x;
         let color = if col < filled {
             sec.level.color(palette)
         } else {
@@ -389,7 +306,6 @@ fn draw_dot_row(
         };
         draw_filled_circle(img, cx, row_y, dot_r, color);
     }
-    Ok(())
 }
 
 // ── Primitive drawing ────────────────────────────────────────────────

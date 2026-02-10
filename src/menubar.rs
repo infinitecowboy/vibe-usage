@@ -1,7 +1,9 @@
 use crate::{
     api::{ParsedUsage, UsageClient},
     history,
-    icons::{generate_status_icon_raw, is_template, RawIcon, SectionVisibility, UsageLevel},
+    icons::{
+        generate_indicator_image, is_template, RawIcon, SectionInfo, SectionVisibility, UsageLevel,
+    },
     keychain, settings,
 };
 use anyhow::Result;
@@ -50,33 +52,22 @@ unsafe fn register_menu_handler() -> id {
         SETTINGS_CHANGED.store(true, Ordering::Relaxed);
     }
 
-    // Toggle show_icon (at least one of icon/label/number must remain on)
+    // Toggle show_icon (at least one of icon/number must remain on)
     extern "C" fn toggle_icon_action(_this: &Object, _cmd: Sel, _sender: id) {
         settings::update(|s| {
             let new_val = !s.show_icon;
-            if new_val || s.show_label || s.show_number {
+            if new_val || s.show_number {
                 s.show_icon = new_val;
             }
         });
         SETTINGS_CHANGED.store(true, Ordering::Relaxed);
     }
 
-    // Toggle show_label (at least one of icon/label/number must remain on)
-    extern "C" fn toggle_label_action(_this: &Object, _cmd: Sel, _sender: id) {
-        settings::update(|s| {
-            let new_val = !s.show_label;
-            if new_val || s.show_icon || s.show_number {
-                s.show_label = new_val;
-            }
-        });
-        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
-    }
-
-    // Toggle show_number (at least one of icon/label/number must remain on)
+    // Toggle show_number (at least one of icon/number must remain on)
     extern "C" fn toggle_number_action(_this: &Object, _cmd: Sel, _sender: id) {
         settings::update(|s| {
             let new_val = !s.show_number;
-            if new_val || s.show_icon || s.show_label {
+            if new_val || s.show_icon {
                 s.show_number = new_val;
             }
         });
@@ -163,10 +154,6 @@ unsafe fn register_menu_handler() -> id {
     decl.add_method(
         sel!(toggleIconAction:),
         toggle_icon_action as extern "C" fn(&Object, Sel, id),
-    );
-    decl.add_method(
-        sel!(toggleLabelAction:),
-        toggle_label_action as extern "C" fn(&Object, Sel, id),
     );
     decl.add_method(
         sel!(toggleNumberAction:),
@@ -270,6 +257,18 @@ impl MenubarApp {
                 app.setActivationPolicy_(
                     NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory,
                 );
+
+                // Set app icon from embedded PNG (shows in Activity Monitor, notifications, etc.)
+                let icon_bytes: &[u8] = include_bytes!("../vibe-usage-icon.png");
+                let ns_data: id = msg_send![class!(NSData),
+                    dataWithBytes: icon_bytes.as_ptr()
+                    length: icon_bytes.len()
+                ];
+                let icon_image: id = msg_send![class!(NSImage), alloc];
+                let icon_image: id = msg_send![icon_image, initWithData: ns_data];
+                if icon_image != nil {
+                    let () = msg_send![app, setApplicationIconImage: icon_image];
+                }
             }
 
             // Create NSStatusItem
@@ -286,23 +285,16 @@ impl MenubarApp {
                 session: cfg.show_session,
                 weekly: cfg.show_weekly,
             };
-            if let Ok(raw) = generate_status_icon_raw(
+            if let Ok(result) = generate_indicator_image(
                 UsageLevel::Low,
                 None,
                 cfg.icon_type,
-                cfg.show_icon,
-                cfg.show_label,
-                cfg.show_number,
                 cfg.color_palette,
                 &cfg.color_thresholds,
                 vis,
                 cfg.icons_colored,
             ) {
-                set_button_image(
-                    button,
-                    &raw,
-                    is_template(cfg.color_palette, cfg.icons_colored),
-                );
+                update_status_button(button, &result.sections, &cfg);
             }
 
             // Build initial menu
@@ -421,23 +413,20 @@ impl MenubarApp {
                                     session: cfg.show_session,
                                     weekly: cfg.show_weekly,
                                 };
-                                if let Ok(raw) = generate_status_icon_raw(
+                                if let Ok(result) = generate_indicator_image(
                                     level,
                                     Some(usage),
                                     cfg.icon_type,
-                                    cfg.show_icon,
-                                    cfg.show_label,
-                                    cfg.show_number,
                                     cfg.color_palette,
                                     &cfg.color_thresholds,
                                     vis,
                                     cfg.icons_colored,
                                 ) {
                                     let button: id = msg_send![si.0, button];
-                                    set_button_image(
+                                    update_status_button(
                                         button,
-                                        &raw,
-                                        is_template(cfg.color_palette, cfg.icons_colored),
+                                        &result.sections,
+                                        &cfg,
                                     );
                                 }
                             }
@@ -1270,19 +1259,6 @@ unsafe fn settings_submenu_item(cfg: &settings::Settings) -> id {
     }
     let () = msg_send![sub, addItem: icon_toggle];
 
-    // ── Show Label toggle ──
-    let label_toggle: id = msg_send![class!(NSMenuItem), alloc];
-    let label_toggle: id = msg_send![label_toggle,
-        initWithTitle: NSString::alloc(nil).init_str("Show Label")
-        action: sel!(toggleLabelAction:)
-        keyEquivalent: NSString::alloc(nil).init_str("")
-    ];
-    let () = msg_send![label_toggle, setTarget: handler];
-    if cfg.show_label {
-        let () = msg_send![label_toggle, setState: 1i64];
-    }
-    let () = msg_send![sub, addItem: label_toggle];
-
     // ── Show Number toggle ──
     let num_toggle: id = msg_send![class!(NSMenuItem), alloc];
     let num_toggle: id = msg_send![num_toggle,
@@ -1507,10 +1483,62 @@ unsafe fn quit_item() -> id {
     item
 }
 
-/// Create NSImage from raw RGBA pixel data and set on button.
-unsafe fn set_button_image(button: id, raw: &RawIcon, template: bool) {
+/// Update the status bar button with interleaved icon+text per section.
+/// Uses NSTextAttachment to embed indicator images inline in the attributed string.
+/// Layout: [icon1] 14%  [icon2] 24%
+unsafe fn update_status_button(
+    button: id,
+    sections: &[SectionInfo],
+    cfg: &settings::Settings,
+) {
     let _pool = NSAutoreleasePool::new(nil);
 
+    // Everything is in the attributed title (images via NSTextAttachment)
+    let () = msg_send![button, setImagePosition: 0i64]; // NSNoImage
+    let () = msg_send![button, setImage: nil];
+
+    let title = build_status_title(sections, cfg);
+    let () = msg_send![button, setAttributedTitle: title];
+}
+
+/// Build an NSMutableAttributedString with interleaved icon images and percentage text.
+/// e.g. [dot]42%  [dot]78% where each section has its own inline icon.
+unsafe fn build_status_title(sections: &[SectionInfo], cfg: &settings::Settings) -> id {
+    let attr_str: id = msg_send![class!(NSMutableAttributedString), alloc];
+    let attr_str: id = msg_send![attr_str, init];
+
+    // Use monospaced digit system font to prevent width jitter
+    let font: id =
+        msg_send![class!(NSFont), monospacedDigitSystemFontOfSize: 12.0f64 weight: 0.0f64];
+
+    for (i, sec) in sections.iter().enumerate() {
+        if i > 0 {
+            append_colored_text(attr_str, "  ", font, secondary_label_color());
+        }
+
+        // Inline icon image via NSTextAttachment
+        if cfg.show_icon {
+            let ns_image = section_icon_to_nsimage(&sec.icon, cfg);
+            if ns_image != nil {
+                append_image_attachment(attr_str, ns_image, font);
+                if cfg.show_number {
+                    append_colored_text(attr_str, " ", font, secondary_label_color());
+                }
+            }
+        }
+
+        // Percentage text
+        if cfg.show_number {
+            let color = level_to_nscolor(sec.level, cfg.color_palette);
+            append_colored_text(attr_str, &format!("{:.0}%", sec.pct), font, color);
+        }
+    }
+
+    attr_str
+}
+
+/// Convert a per-section RawIcon to an NSImage for use in NSTextAttachment.
+unsafe fn section_icon_to_nsimage(raw: &RawIcon, cfg: &settings::Settings) -> id {
     let rep: id = msg_send![class!(NSBitmapImageRep), alloc];
     let rep: id = msg_send![rep,
         initWithBitmapDataPlanes: std::ptr::null_mut::<*mut u8>()
@@ -1526,10 +1554,9 @@ unsafe fn set_button_image(button: id, raw: &RawIcon, template: bool) {
     ];
 
     if rep == nil {
-        return;
+        return nil;
     }
 
-    // Copy pixel data into the rep's own buffer
     let rep_data: *mut u8 = msg_send![rep, bitmapData];
     if !rep_data.is_null() {
         std::ptr::copy_nonoverlapping(raw.rgba.as_ptr(), rep_data, raw.rgba.len());
@@ -1539,8 +1566,79 @@ unsafe fn set_button_image(button: id, raw: &RawIcon, template: bool) {
     let logical = NSSize::new(raw.width as f64 / 2.0, raw.height as f64 / 2.0);
     let img: id = msg_send![img, initWithSize: logical];
     let () = msg_send![img, addRepresentation: rep];
+    let template = is_template(cfg.color_palette, cfg.icons_colored);
     let () = msg_send![img, setTemplate: template];
-    let () = msg_send![button, setImage: img];
+    img
+}
+
+/// Append an inline image to an NSMutableAttributedString via NSTextAttachment.
+unsafe fn append_image_attachment(attr_str: id, image: id, font: id) {
+    let attachment: id = msg_send![class!(NSTextAttachment), alloc];
+    let attachment: id = msg_send![attachment, init];
+    let () = msg_send![attachment, setImage: image];
+
+    // Size the image to match the text line height
+    let img_size: NSSize = msg_send![image, size];
+    let target_h = 14.0f64;
+    let scale = target_h / img_size.height;
+    let target_w = img_size.width * scale;
+    // Offset down slightly to vertically center with text baseline
+    let bounds = NSRect::new(
+        NSPoint::new(0.0, -2.0),
+        NSSize::new(target_w, target_h),
+    );
+    let () = msg_send![attachment, setBounds: bounds];
+
+    let attached_str: id =
+        msg_send![class!(NSAttributedString), attributedStringWithAttachment: attachment];
+
+    // Apply font attribute so the attachment participates in proper line metrics
+    let range = cocoa::foundation::NSRange::new(0, 1);
+    let mutable: id = msg_send![class!(NSMutableAttributedString), alloc];
+    let mutable: id = msg_send![mutable, initWithAttributedString: attached_str];
+    let font_key = NSString::alloc(nil).init_str("NSFont");
+    let () = msg_send![mutable, addAttribute: font_key value: font range: range];
+    let () = msg_send![attr_str, appendAttributedString: mutable];
+}
+
+/// Append a colored text segment to an NSMutableAttributedString.
+unsafe fn append_colored_text(attr_str: id, text: &str, font: id, color: id) {
+    let ns_str = NSString::alloc(nil).init_str(text);
+
+    // Build attributes dictionary
+    let font_key = NSString::alloc(nil).init_str("NSFont");
+    let color_key = NSString::alloc(nil).init_str("NSColor");
+    let keys: [id; 2] = [font_key, color_key];
+    let vals: [id; 2] = [font, color];
+    let dict: id = msg_send![class!(NSDictionary),
+        dictionaryWithObjects: vals.as_ptr()
+        forKeys: keys.as_ptr()
+        count: 2usize
+    ];
+
+    let segment: id = msg_send![class!(NSAttributedString), alloc];
+    let segment: id = msg_send![segment, initWithString: ns_str attributes: dict];
+    let () = msg_send![attr_str, appendAttributedString: segment];
+}
+
+/// Map a UsageLevel to an NSColor for the attributed string text.
+unsafe fn level_to_nscolor(level: UsageLevel, palette: settings::ColorPalette) -> id {
+    match palette {
+        settings::ColorPalette::Monochrome => {
+            msg_send![class!(NSColor), labelColor]
+        }
+        settings::ColorPalette::Default => match level {
+            UsageLevel::Low => msg_send![class!(NSColor), systemGreenColor],
+            UsageLevel::Medium => msg_send![class!(NSColor), systemYellowColor],
+            UsageLevel::High => msg_send![class!(NSColor), systemOrangeColor],
+            UsageLevel::Critical => msg_send![class!(NSColor), systemRedColor],
+        },
+    }
+}
+
+/// NSColor.secondaryLabelColor — adapts to light/dark mode automatically.
+unsafe fn secondary_label_color() -> id {
+    msg_send![class!(NSColor), secondaryLabelColor]
 }
 
 // ── Notifications ────────────────────────────────────────────────────
