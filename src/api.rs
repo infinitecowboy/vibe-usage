@@ -44,7 +44,7 @@ pub struct ParsedUsage {
 impl UsageClient {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            client: Client::builder().user_agent("claude-code/2.1.31").build()?,
+            client: Client::builder().user_agent("vibe-usage/0.1.0").build()?,
         })
     }
 
