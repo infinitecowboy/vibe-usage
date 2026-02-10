@@ -1792,29 +1792,52 @@ fn launch_agent_path() -> std::path::PathBuf {
         .join(format!("{}.plist", LAUNCH_AGENT_LABEL))
 }
 
+/// Resolve the .app bundle path if the binary is inside one (Contents/MacOS/),
+/// otherwise fall back to the bare binary path.
+fn resolve_app_bundle() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // Check if we're inside a .app bundle: <name>.app/Contents/MacOS/<binary>
+    let parent = exe.parent()?; // MacOS/
+    if parent.file_name()?.to_str()? != "MacOS" {
+        return None;
+    }
+    let contents = parent.parent()?; // Contents/
+    if contents.file_name()?.to_str()? != "Contents" {
+        return None;
+    }
+    let bundle = contents.parent()?; // <name>.app
+    if bundle.extension()?.to_str()? != "app" {
+        return None;
+    }
+    Some(bundle.to_path_buf())
+}
+
 fn set_launch_at_login(enable: bool) {
     let path = launch_agent_path();
     if enable {
-        // Find current binary path
-        let exe = std::env::current_exe().unwrap_or_default();
-        let exe_escaped = exe
-            .display()
-            .to_string()
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;");
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+        let xml_escape = |s: &str| -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&apos;")
+        };
+
+        // Prefer launching via `open <bundle>.app` so macOS reads the icon/Info.plist.
+        // Fall back to bare binary if not running from a bundle.
+        let plist = if let Some(bundle) = resolve_app_bundle() {
+            let bundle_path = xml_escape(&bundle.display().to_string());
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{}</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{}</string>
+        <string>/usr/bin/open</string>
+        <string>{bundle}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -1822,9 +1845,34 @@ fn set_launch_at_login(enable: bool) {
     <false/>
 </dict>
 </plist>"#,
-            LAUNCH_AGENT_LABEL,
-            exe_escaped
-        );
+                label = LAUNCH_AGENT_LABEL,
+                bundle = bundle_path
+            )
+        } else {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let exe_escaped = xml_escape(&exe.display().to_string());
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"#,
+                label = LAUNCH_AGENT_LABEL,
+                exe = exe_escaped
+            )
+        };
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
