@@ -124,6 +124,8 @@ pub struct Settings {
     pub color_thresholds: ColorThresholds,
     #[serde(default = "default_true")]
     pub icons_colored: bool,
+    #[serde(default)]
+    pub neutral_text: bool,
 }
 
 fn default_icon_type() -> IconType {
@@ -163,6 +165,7 @@ impl Default for Settings {
             color_palette: ColorPalette::Default,
             color_thresholds: ColorThresholds::default(),
             icons_colored: true,
+            neutral_text: false,
         }
     }
 }

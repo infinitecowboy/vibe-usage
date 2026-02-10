@@ -125,6 +125,11 @@ unsafe fn register_menu_handler() -> id {
         SETTINGS_CHANGED.store(true, Ordering::Relaxed);
     }
 
+    extern "C" fn toggle_neutral_text_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| s.neutral_text = !s.neutral_text);
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
     extern "C" fn toggle_monochrome_action(_this: &Object, _cmd: Sel, _sender: id) {
         settings::update(|s| {
             s.color_palette = match s.color_palette {
@@ -186,6 +191,10 @@ unsafe fn register_menu_handler() -> id {
     decl.add_method(
         sel!(toggleIconsColoredAction:),
         toggle_icons_colored_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleNeutralTextAction:),
+        toggle_neutral_text_action as extern "C" fn(&Object, Sel, id),
     );
     decl.add_method(
         sel!(toggleMonochromeAction:),
@@ -1300,6 +1309,19 @@ unsafe fn settings_submenu_item(cfg: &settings::Settings) -> id {
     }
     let () = msg_send![sub, addItem: icons_colored_item];
 
+    // ── Neutral Text toggle ──
+    let neutral_text_item: id = msg_send![class!(NSMenuItem), alloc];
+    let neutral_text_item: id = msg_send![neutral_text_item,
+        initWithTitle: NSString::alloc(nil).init_str("Neutral Text")
+        action: sel!(toggleNeutralTextAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![neutral_text_item, setTarget: handler];
+    if cfg.neutral_text {
+        let () = msg_send![neutral_text_item, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: neutral_text_item];
+
     let () = msg_send![sub, addItem: separator()];
 
     // ── Usage Thresholds preset group ──
@@ -1529,7 +1551,11 @@ unsafe fn build_status_title(sections: &[SectionInfo], cfg: &settings::Settings)
 
         // Percentage text
         if cfg.show_number {
-            let color = level_to_nscolor(sec.level, cfg.color_palette);
+            let color = if cfg.neutral_text {
+                msg_send![class!(NSColor), labelColor]
+            } else {
+                level_to_nscolor(sec.level, cfg.color_palette)
+            };
             append_colored_text(attr_str, &format!("{:.0}%", sec.pct), font, color);
         }
     }
