@@ -130,6 +130,24 @@ unsafe fn register_menu_handler() -> id {
         SETTINGS_CHANGED.store(true, Ordering::Relaxed);
     }
 
+    extern "C" fn toggle_show_in_dock_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| s.show_in_dock = !s.show_in_dock);
+        let show = settings::get().show_in_dock;
+        unsafe {
+            let app = NSApp();
+            if show {
+                app.setActivationPolicy_(
+                    NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
+                );
+            } else {
+                app.setActivationPolicy_(
+                    NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory,
+                );
+            }
+        }
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
     extern "C" fn toggle_monochrome_action(_this: &Object, _cmd: Sel, _sender: id) {
         settings::update(|s| {
             s.color_palette = match s.color_palette {
@@ -195,6 +213,10 @@ unsafe fn register_menu_handler() -> id {
     decl.add_method(
         sel!(toggleNeutralTextAction:),
         toggle_neutral_text_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleShowInDockAction:),
+        toggle_show_in_dock_action as extern "C" fn(&Object, Sel, id),
     );
     decl.add_method(
         sel!(toggleMonochromeAction:),
@@ -263,9 +285,16 @@ impl MenubarApp {
         unsafe {
             let app = NSApp();
             if app != nil {
-                app.setActivationPolicy_(
-                    NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory,
-                );
+                let cfg_startup = settings::get();
+                if cfg_startup.show_in_dock {
+                    app.setActivationPolicy_(
+                        NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
+                    );
+                } else {
+                    app.setActivationPolicy_(
+                        NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory,
+                    );
+                }
 
                 // Set app icon from embedded PNG (shows in Activity Monitor, notifications, etc.)
                 let icon_bytes: &[u8] = include_bytes!("../vibe-usage-icon.png");
@@ -1460,6 +1489,19 @@ unsafe fn settings_submenu_item(cfg: &settings::Settings) -> id {
         let () = msg_send![login_item, setState: 1i64];
     }
     let () = msg_send![sub, addItem: login_item];
+
+    // ── Show in Dock toggle ──
+    let dock_item: id = msg_send![class!(NSMenuItem), alloc];
+    let dock_item: id = msg_send![dock_item,
+        initWithTitle: NSString::alloc(nil).init_str("Show in Dock")
+        action: sel!(toggleShowInDockAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![dock_item, setTarget: handler];
+    if cfg.show_in_dock {
+        let () = msg_send![dock_item, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: dock_item];
 
     // ── Create the parent item with gear icon ──
     let parent: id = msg_send![class!(NSMenuItem), alloc];

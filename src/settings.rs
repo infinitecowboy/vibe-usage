@@ -126,6 +126,8 @@ pub struct Settings {
     pub icons_colored: bool,
     #[serde(default)]
     pub neutral_text: bool,
+    #[serde(default)]
+    pub show_in_dock: bool,
 }
 
 fn default_icon_type() -> IconType {
@@ -170,6 +172,7 @@ impl Default for Settings {
             },
             icons_colored: true,
             neutral_text: true,
+            show_in_dock: false,
         }
     }
 }
