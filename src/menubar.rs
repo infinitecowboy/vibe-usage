@@ -139,6 +139,9 @@ unsafe fn register_menu_handler() -> id {
                 app.setActivationPolicy_(
                     NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
                 );
+                // Refresh dock tile to show custom icon
+                let dock_tile: id = msg_send![app, dockTile];
+                let () = msg_send![dock_tile, display];
             } else {
                 app.setActivationPolicy_(
                     NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory,
@@ -296,7 +299,7 @@ impl MenubarApp {
                     );
                 }
 
-                // Set app icon from embedded PNG (shows in Activity Monitor, notifications, etc.)
+                // Set app icon from embedded PNG
                 let icon_bytes: &[u8] = include_bytes!("../vibe-usage-icon.png");
                 let ns_data: id = msg_send![class!(NSData),
                     dataWithBytes: icon_bytes.as_ptr()
