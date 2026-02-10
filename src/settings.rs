@@ -155,17 +155,21 @@ impl Default for Settings {
             show_number: true,
             show_session: true,
             show_weekly: true,
-            show_sonnet: true,
-            show_extra: true,
+            show_sonnet: false,
+            show_extra: false,
             notify_enabled: false,
             notify_session_threshold: 80,
             notify_weekly_threshold: 80,
-            refresh_interval: RefreshInterval(300),
-            launch_at_login: false,
+            refresh_interval: RefreshInterval(120),
+            launch_at_login: true,
             color_palette: ColorPalette::Default,
-            color_thresholds: ColorThresholds::default(),
+            color_thresholds: ColorThresholds {
+                warning: 30,
+                high: 60,
+                critical: 90,
+            },
             icons_colored: true,
-            neutral_text: false,
+            neutral_text: true,
         }
     }
 }
