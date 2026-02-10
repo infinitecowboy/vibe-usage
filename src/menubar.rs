@@ -1794,6 +1794,14 @@ fn set_launch_at_login(enable: bool) {
     if enable {
         // Find current binary path
         let exe = std::env::current_exe().unwrap_or_default();
+        let exe_escaped = exe
+            .display()
+            .to_string()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;");
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1812,7 +1820,7 @@ fn set_launch_at_login(enable: bool) {
 </dict>
 </plist>"#,
             LAUNCH_AGENT_LABEL,
-            exe.display()
+            exe_escaped
         );
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
