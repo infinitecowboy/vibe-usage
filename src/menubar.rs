@@ -1,9 +1,7 @@
 use crate::{
     api::{ParsedUsage, UsageClient},
     history,
-    icons::{
-        generate_indicator_image, is_template, RawIcon, SectionInfo, SectionVisibility, UsageLevel,
-    },
+    icons::{generate_indicator, RawIcon, SectionInfo, SectionVisibility, UsageLevel},
     keychain, settings,
 };
 use anyhow::Result;
@@ -36,20 +34,6 @@ unsafe fn register_menu_handler() -> id {
 
     extern "C" fn refresh_action(_this: &Object, _cmd: Sel, _sender: id) {
         REFRESH_REQUESTED.store(true, Ordering::Relaxed);
-    }
-
-    // Icon type actions: tag encodes the IconType variant index
-    extern "C" fn set_icon_type_action(_this: &Object, _cmd: Sel, sender: id) {
-        let tag: isize = unsafe { msg_send![sender, tag] };
-        let icon_type = match tag {
-            0 => settings::IconType::Dot,
-            1 => settings::IconType::SignalBars,
-            2 => settings::IconType::MiniBars,
-            3 => settings::IconType::DotGrid,
-            _ => return,
-        };
-        settings::update(|s| s.icon_type = icon_type);
-        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
     }
 
     // Toggle show_icon (at least one of icon/number must remain on)
@@ -172,10 +156,6 @@ unsafe fn register_menu_handler() -> id {
     decl.add_method(
         sel!(refreshAction:),
         refresh_action as extern "C" fn(&Object, Sel, id),
-    );
-    decl.add_method(
-        sel!(setIconTypeAction:),
-        set_icon_type_action as extern "C" fn(&Object, Sel, id),
     );
     decl.add_method(
         sel!(toggleIconAction:),
@@ -326,15 +306,13 @@ impl MenubarApp {
                 session: cfg.show_session,
                 weekly: cfg.show_weekly,
             };
-            if let Ok(result) = generate_indicator_image(
-                UsageLevel::Low,
-                None,
-                cfg.icon_type,
-                cfg.color_palette,
-                &cfg.color_thresholds,
-                vis,
-                cfg.icons_colored,
-            ) {
+            {
+                let result = generate_indicator(
+                    UsageLevel::Low,
+                    None,
+                    &cfg.color_thresholds,
+                    vis,
+                );
                 update_status_button(button, &result.sections, &cfg);
             }
 
@@ -454,15 +432,13 @@ impl MenubarApp {
                                     session: cfg.show_session,
                                     weekly: cfg.show_weekly,
                                 };
-                                if let Ok(result) = generate_indicator_image(
-                                    level,
-                                    Some(usage),
-                                    cfg.icon_type,
-                                    cfg.color_palette,
-                                    &cfg.color_thresholds,
-                                    vis,
-                                    cfg.icons_colored,
-                                ) {
+                                {
+                                    let result = generate_indicator(
+                                        level,
+                                        Some(usage),
+                                        &cfg.color_thresholds,
+                                        vis,
+                                    );
                                     let button: id = msg_send![si.0, button];
                                     update_status_button(
                                         button,
@@ -1226,33 +1202,6 @@ unsafe fn settings_submenu_item(cfg: &settings::Settings) -> id {
 
     let sub: id = msg_send![class!(NSMenu), new];
 
-    // ── Icon Type radio group ──
-    let icon_header: id = msg_send![class!(NSMenuItem), alloc];
-    let icon_header: id = msg_send![icon_header,
-        initWithTitle: NSString::alloc(nil).init_str("Icon Type")
-        action: cocoa::base::nil
-        keyEquivalent: NSString::alloc(nil).init_str("")
-    ];
-    let () = msg_send![icon_header, setEnabled: NO];
-    let () = msg_send![sub, addItem: icon_header];
-
-    for (i, icon_type) in settings::IconType::ALL.iter().enumerate() {
-        let item: id = msg_send![class!(NSMenuItem), alloc];
-        let item: id = msg_send![item,
-            initWithTitle: NSString::alloc(nil).init_str(icon_type.label())
-            action: sel!(setIconTypeAction:)
-            keyEquivalent: NSString::alloc(nil).init_str("")
-        ];
-        let () = msg_send![item, setTarget: handler];
-        let () = msg_send![item, setTag: i as isize];
-        if *icon_type == cfg.icon_type {
-            let () = msg_send![item, setState: 1i64]; // NSControlStateValueOn
-        }
-        let () = msg_send![sub, addItem: item];
-    }
-
-    let () = msg_send![sub, addItem: separator()];
-
     // ── Show Usage Categories toggles ──
     let sections_header: id = msg_send![class!(NSMenuItem), alloc];
     let sections_header: id = msg_send![sections_header,
@@ -1550,9 +1499,213 @@ unsafe fn quit_item() -> id {
     item
 }
 
-/// Update the status bar button with interleaved icon+text per section.
-/// Uses NSTextAttachment to embed indicator images inline in the attributed string.
-/// Layout: [icon1] 14%  [icon2] 24%
+/// Load Berkeley Mono font, with fallbacks to BerkeleyMono-Regular then system monospace.
+unsafe fn berkeley_mono(size: f64) -> id {
+    let name1 = NSString::alloc(nil).init_str("Berkeley Mono");
+    let font: id = msg_send![class!(NSFont), fontWithName: name1 size: size];
+    if font != nil {
+        return font;
+    }
+    let name2 = NSString::alloc(nil).init_str("BerkeleyMono-Regular");
+    let font: id = msg_send![class!(NSFont), fontWithName: name2 size: size];
+    if font != nil {
+        return font;
+    }
+    msg_send![class!(NSFont), monospacedSystemFontOfSize: size weight: 0.0f64]
+}
+
+/// Return index of the section with the highest usage percentage.
+/// Session wins ties.
+fn active_section_index(sections: &[SectionInfo]) -> usize {
+    let mut best = 0usize;
+    let mut best_pct = f32::NEG_INFINITY;
+    for (i, sec) in sections.iter().enumerate() {
+        if sec.pct > best_pct {
+            best_pct = sec.pct;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Render a pill-style menubar image using native NSFont drawing.
+/// The active section (highest usage) gets a white pill background with dark text.
+/// Other sections are dimmed. Small colored dots indicate usage level.
+unsafe fn render_pill_image(sections: &[SectionInfo], cfg: &settings::Settings) -> id {
+    let _pool = NSAutoreleasePool::new(nil);
+
+    const PILL_SPACING: f64 = 6.0;
+    const PILL_PAD_H: f64 = 6.0;
+    const PILL_PAD_V: f64 = 2.0;
+    const PILL_CORNER_RADIUS: f64 = 4.0;
+    const DOT_DIAMETER: f64 = 5.0;
+    const DOT_TEXT_GAP: f64 = 3.0;
+    const FONT_SIZE: f64 = 12.0;
+
+    if sections.is_empty() {
+        // No data placeholder
+        let font = berkeley_mono(FONT_SIZE);
+        let dimmed = NSColor_rgba(1.0, 1.0, 1.0, 0.5);
+        let font_key = NSString::alloc(nil).init_str("NSFont");
+        let color_key = NSString::alloc(nil).init_str("NSColor");
+        let keys: [id; 2] = [font_key, color_key];
+        let vals: [id; 2] = [font, dimmed];
+        let attrs: id = msg_send![class!(NSDictionary),
+            dictionaryWithObjects: vals.as_ptr()
+            forKeys: keys.as_ptr()
+            count: 2usize
+        ];
+        let placeholder = NSString::alloc(nil).init_str("...");
+        let size: NSSize = msg_send![placeholder, sizeWithAttributes: attrs];
+        let img_w = size.width + PILL_PAD_H * 2.0;
+        let img_h = 22.0f64;
+        let img: id = msg_send![class!(NSImage), alloc];
+        let img: id = msg_send![img, initWithSize: NSSize::new(img_w, img_h)];
+        let () = msg_send![img, lockFocus];
+        let pt = NSPoint::new(PILL_PAD_H, (img_h - size.height) / 2.0);
+        let () = msg_send![placeholder, drawAtPoint: pt withAttributes: attrs];
+        let () = msg_send![img, unlockFocus];
+        let () = msg_send![img, setTemplate: false];
+        return img;
+    }
+
+    let active = active_section_index(sections);
+    let font = berkeley_mono(FONT_SIZE);
+
+    // Build label strings and measure them
+    let font_key = NSString::alloc(nil).init_str("NSFont");
+    let color_key = NSString::alloc(nil).init_str("NSColor");
+
+    // Use a neutral color just for measuring
+    let measure_color: id = msg_send![class!(NSColor), whiteColor];
+    let measure_keys: [id; 2] = [font_key, color_key];
+    let measure_vals: [id; 2] = [font, measure_color];
+    let measure_attrs: id = msg_send![class!(NSDictionary),
+        dictionaryWithObjects: measure_vals.as_ptr()
+        forKeys: measure_keys.as_ptr()
+        count: 2usize
+    ];
+
+    struct PillSection {
+        label_ns: id,
+        label_size: NSSize,
+        has_dot: bool,
+        has_text: bool,
+    }
+
+    let mut pill_sections: Vec<PillSection> = Vec::new();
+
+    for sec in sections.iter() {
+        let text = if cfg.show_number {
+            format!("{} {:.0}%", sec.label, sec.pct)
+        } else {
+            sec.label.to_string()
+        };
+        let ns_str = NSString::alloc(nil).init_str(&text);
+        let size: NSSize = msg_send![ns_str, sizeWithAttributes: measure_attrs];
+        pill_sections.push(PillSection {
+            label_ns: ns_str,
+            label_size: size,
+            has_dot: cfg.show_icon,
+            has_text: true,
+        });
+    }
+
+    // Calculate total image width
+    let img_h = 22.0f64;
+    let mut total_w = 0.0f64;
+    for (i, ps) in pill_sections.iter().enumerate() {
+        if i > 0 {
+            total_w += PILL_SPACING;
+        }
+        let mut sec_w = 0.0;
+        if ps.has_dot {
+            sec_w += DOT_DIAMETER + DOT_TEXT_GAP;
+        }
+        if ps.has_text {
+            sec_w += ps.label_size.width;
+        }
+        sec_w += PILL_PAD_H * 2.0;
+        total_w += sec_w;
+    }
+
+    let img: id = msg_send![class!(NSImage), alloc];
+    let img: id = msg_send![img, initWithSize: NSSize::new(total_w, img_h)];
+    let () = msg_send![img, lockFocus];
+
+    let mut x = 0.0f64;
+    for (i, ps) in pill_sections.iter().enumerate() {
+        if i > 0 {
+            x += PILL_SPACING;
+        }
+
+        let mut sec_w = PILL_PAD_H * 2.0;
+        if ps.has_dot {
+            sec_w += DOT_DIAMETER + DOT_TEXT_GAP;
+        }
+        if ps.has_text {
+            sec_w += ps.label_size.width;
+        }
+
+        let is_active = i == active;
+
+        // Draw pill background for active section
+        if is_active {
+            let pill_rect = NSRect::new(
+                NSPoint::new(x, (img_h - ps.label_size.height - PILL_PAD_V * 2.0) / 2.0),
+                NSSize::new(sec_w, ps.label_size.height + PILL_PAD_V * 2.0),
+            );
+            let pill_color = NSColor_rgba(1.0, 1.0, 1.0, 0.9);
+            let () = msg_send![pill_color, setFill];
+            let path: id =
+                msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: pill_rect xRadius: PILL_CORNER_RADIUS yRadius: PILL_CORNER_RADIUS];
+            let () = msg_send![path, fill];
+        }
+
+        let mut inner_x = x + PILL_PAD_H;
+
+        // Draw colored dot
+        if ps.has_dot {
+            let dot_color = level_to_nscolor(sections[i].level, cfg.color_palette);
+            let () = msg_send![dot_color, setFill];
+            let dot_y = (img_h - DOT_DIAMETER) / 2.0;
+            let dot_rect = NSRect::new(
+                NSPoint::new(inner_x, dot_y),
+                NSSize::new(DOT_DIAMETER, DOT_DIAMETER),
+            );
+            let oval: id = msg_send![class!(NSBezierPath), bezierPathWithOvalInRect: dot_rect];
+            let () = msg_send![oval, fill];
+            inner_x += DOT_DIAMETER + DOT_TEXT_GAP;
+        }
+
+        // Draw text
+        if ps.has_text {
+            let text_color = if is_active {
+                NSColor_rgba(0.0, 0.0, 0.0, 0.85)
+            } else {
+                NSColor_rgba(1.0, 1.0, 1.0, 0.5)
+            };
+            let draw_keys: [id; 2] = [font_key, color_key];
+            let draw_vals: [id; 2] = [font, text_color];
+            let draw_attrs: id = msg_send![class!(NSDictionary),
+                dictionaryWithObjects: draw_vals.as_ptr()
+                forKeys: draw_keys.as_ptr()
+                count: 2usize
+            ];
+            let text_y = (img_h - ps.label_size.height) / 2.0;
+            let pt = NSPoint::new(inner_x, text_y);
+            let () = msg_send![ps.label_ns, drawAtPoint: pt withAttributes: draw_attrs];
+        }
+
+        x += sec_w;
+    }
+
+    let () = msg_send![img, unlockFocus];
+    let () = msg_send![img, setTemplate: false];
+    img
+}
+
+/// Update the status bar button with pill-style image.
 unsafe fn update_status_button(
     button: id,
     sections: &[SectionInfo],
@@ -1560,139 +1713,15 @@ unsafe fn update_status_button(
 ) {
     let _pool = NSAutoreleasePool::new(nil);
 
-    // Everything is in the attributed title (images via NSTextAttachment)
-    let () = msg_send![button, setImagePosition: 0i64]; // NSNoImage
-    let () = msg_send![button, setImage: nil];
-
-    let title = build_status_title(sections, cfg);
-    let () = msg_send![button, setAttributedTitle: title];
+    let pill_image = render_pill_image(sections, cfg);
+    let () = msg_send![button, setImage: pill_image];
+    let () = msg_send![button, setImagePosition: 1i64]; // NSImageOnly
+    let empty: id = msg_send![class!(NSMutableAttributedString), alloc];
+    let empty: id = msg_send![empty, init];
+    let () = msg_send![button, setAttributedTitle: empty];
 }
 
-/// Build an NSMutableAttributedString with interleaved icon images and percentage text.
-/// e.g. [dot]42%  [dot]78% where each section has its own inline icon.
-unsafe fn build_status_title(sections: &[SectionInfo], cfg: &settings::Settings) -> id {
-    let attr_str: id = msg_send![class!(NSMutableAttributedString), alloc];
-    let attr_str: id = msg_send![attr_str, init];
-
-    // Use monospaced digit system font to prevent width jitter
-    let font: id =
-        msg_send![class!(NSFont), monospacedDigitSystemFontOfSize: 12.0f64 weight: 0.0f64];
-
-    for (i, sec) in sections.iter().enumerate() {
-        if i > 0 {
-            append_colored_text(attr_str, "  ", font, secondary_label_color());
-        }
-
-        // Inline icon image via NSTextAttachment
-        if cfg.show_icon {
-            let ns_image = section_icon_to_nsimage(&sec.icon, cfg);
-            if ns_image != nil {
-                append_image_attachment(attr_str, ns_image, font);
-                if cfg.show_number {
-                    append_colored_text(attr_str, " ", font, secondary_label_color());
-                }
-            }
-        }
-
-        // Percentage text
-        if cfg.show_number {
-            let color = if cfg.neutral_text {
-                msg_send![class!(NSColor), labelColor]
-            } else {
-                level_to_nscolor(sec.level, cfg.color_palette)
-            };
-            append_colored_text(attr_str, &format!("{:.0}%", sec.pct), font, color);
-        }
-    }
-
-    attr_str
-}
-
-/// Convert a per-section RawIcon to an NSImage for use in NSTextAttachment.
-unsafe fn section_icon_to_nsimage(raw: &RawIcon, cfg: &settings::Settings) -> id {
-    let rep: id = msg_send![class!(NSBitmapImageRep), alloc];
-    let rep: id = msg_send![rep,
-        initWithBitmapDataPlanes: std::ptr::null_mut::<*mut u8>()
-        pixelsWide: raw.width as i64
-        pixelsHigh: raw.height as i64
-        bitsPerSample: 8i64
-        samplesPerPixel: 4i64
-        hasAlpha: true
-        isPlanar: false
-        colorSpaceName: NSString::alloc(nil).init_str("NSDeviceRGBColorSpace")
-        bytesPerRow: (raw.width * 4) as i64
-        bitsPerPixel: 32i64
-    ];
-
-    if rep == nil {
-        return nil;
-    }
-
-    let rep_data: *mut u8 = msg_send![rep, bitmapData];
-    if !rep_data.is_null() {
-        std::ptr::copy_nonoverlapping(raw.rgba.as_ptr(), rep_data, raw.rgba.len());
-    }
-
-    let img: id = msg_send![class!(NSImage), alloc];
-    let logical = NSSize::new(raw.width as f64 / 2.0, raw.height as f64 / 2.0);
-    let img: id = msg_send![img, initWithSize: logical];
-    let () = msg_send![img, addRepresentation: rep];
-    let template = is_template(cfg.color_palette, cfg.icons_colored);
-    let () = msg_send![img, setTemplate: template];
-    img
-}
-
-/// Append an inline image to an NSMutableAttributedString via NSTextAttachment.
-unsafe fn append_image_attachment(attr_str: id, image: id, font: id) {
-    let attachment: id = msg_send![class!(NSTextAttachment), alloc];
-    let attachment: id = msg_send![attachment, init];
-    let () = msg_send![attachment, setImage: image];
-
-    // Size the image to match the text line height
-    let img_size: NSSize = msg_send![image, size];
-    let target_h = 14.0f64;
-    let scale = target_h / img_size.height;
-    let target_w = img_size.width * scale;
-    // Offset down slightly to vertically center with text baseline
-    let bounds = NSRect::new(
-        NSPoint::new(0.0, -2.0),
-        NSSize::new(target_w, target_h),
-    );
-    let () = msg_send![attachment, setBounds: bounds];
-
-    let attached_str: id =
-        msg_send![class!(NSAttributedString), attributedStringWithAttachment: attachment];
-
-    // Apply font attribute so the attachment participates in proper line metrics
-    let range = cocoa::foundation::NSRange::new(0, 1);
-    let mutable: id = msg_send![class!(NSMutableAttributedString), alloc];
-    let mutable: id = msg_send![mutable, initWithAttributedString: attached_str];
-    let font_key = NSString::alloc(nil).init_str("NSFont");
-    let () = msg_send![mutable, addAttribute: font_key value: font range: range];
-    let () = msg_send![attr_str, appendAttributedString: mutable];
-}
-
-/// Append a colored text segment to an NSMutableAttributedString.
-unsafe fn append_colored_text(attr_str: id, text: &str, font: id, color: id) {
-    let ns_str = NSString::alloc(nil).init_str(text);
-
-    // Build attributes dictionary
-    let font_key = NSString::alloc(nil).init_str("NSFont");
-    let color_key = NSString::alloc(nil).init_str("NSColor");
-    let keys: [id; 2] = [font_key, color_key];
-    let vals: [id; 2] = [font, color];
-    let dict: id = msg_send![class!(NSDictionary),
-        dictionaryWithObjects: vals.as_ptr()
-        forKeys: keys.as_ptr()
-        count: 2usize
-    ];
-
-    let segment: id = msg_send![class!(NSAttributedString), alloc];
-    let segment: id = msg_send![segment, initWithString: ns_str attributes: dict];
-    let () = msg_send![attr_str, appendAttributedString: segment];
-}
-
-/// Map a UsageLevel to an NSColor for the attributed string text.
+/// Map a UsageLevel to an NSColor for the pill dot.
 unsafe fn level_to_nscolor(level: UsageLevel, palette: settings::ColorPalette) -> id {
     match palette {
         settings::ColorPalette::Monochrome => {
@@ -1705,11 +1734,6 @@ unsafe fn level_to_nscolor(level: UsageLevel, palette: settings::ColorPalette) -
             UsageLevel::Critical => msg_send![class!(NSColor), systemRedColor],
         },
     }
-}
-
-/// NSColor.secondaryLabelColor — adapts to light/dark mode automatically.
-unsafe fn secondary_label_color() -> id {
-    msg_send![class!(NSColor), secondaryLabelColor]
 }
 
 // ── Notifications ────────────────────────────────────────────────────

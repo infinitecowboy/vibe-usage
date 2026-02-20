@@ -7,27 +7,15 @@ static SETTINGS: OnceLock<Mutex<Settings>> = OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IconType {
-    Dot,        // colored circle (session level)
-    SignalBars, // 4 ascending bars (weekly quartiles)
-    MiniBars,   // vertical fill bars (one per visible session)
-    DotGrid,    // 2x4 dot grid with S/W labels
+    Pill,
+    // Legacy variants kept for serde deserialization of old settings
+    #[serde(other)]
+    _Legacy,
 }
 
-impl IconType {
-    pub const ALL: [IconType; 4] = [
-        IconType::Dot,
-        IconType::SignalBars,
-        IconType::MiniBars,
-        IconType::DotGrid,
-    ];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Dot => "Dot",
-            Self::SignalBars => "Signal Bars",
-            Self::MiniBars => "Mini Bars",
-            Self::DotGrid => "Dot Grid",
-        }
+impl Default for IconType {
+    fn default() -> Self {
+        Self::Pill
     }
 }
 
@@ -131,7 +119,7 @@ pub struct Settings {
 }
 
 fn default_icon_type() -> IconType {
-    IconType::Dot
+    IconType::Pill
 }
 fn default_notify_enabled() -> bool {
     false
@@ -152,7 +140,7 @@ fn default_true() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            icon_type: IconType::Dot,
+            icon_type: IconType::Pill,
             show_icon: true,
             show_number: true,
             show_session: true,
@@ -205,13 +193,11 @@ pub fn load() -> Settings {
             .map(String::from)
         {
             let (icon_type, show_icon, show_num) = match old_style.as_str() {
-                "detailed" => ("dot", true, true),
-                "compact" => ("dot", true, false),
-                "text_only" => ("dot", false, true),
-                "icon_only" => ("dot", true, false),
-                "mini_bars" => ("mini_bars", true, false),
-                "dot_grid" => ("dot_grid", true, false),
-                _ => ("dot", true, true),
+                "detailed" => ("pill", true, true),
+                "compact" => ("pill", true, false),
+                "text_only" => ("pill", false, true),
+                "icon_only" => ("pill", true, false),
+                _ => ("pill", true, true),
             };
             if let Some(obj) = val.as_object_mut() {
                 obj.remove("menubar_style");
@@ -238,10 +224,12 @@ pub fn load() -> Settings {
                     changed = true;
                 }
             }
-            // Migrate icon_type "none" -> "dot"
-            if obj.get("icon_type").and_then(|v| v.as_str()) == Some("none") {
-                obj.insert("icon_type".into(), serde_json::Value::String("dot".into()));
-                changed = true;
+            // Migrate any old icon_type -> "pill"
+            if let Some(it) = obj.get("icon_type").and_then(|v| v.as_str()).map(String::from) {
+                if it != "pill" {
+                    obj.insert("icon_type".into(), serde_json::Value::String("pill".into()));
+                    changed = true;
+                }
             }
             // Migrate colorblind palette -> default
             if obj.get("color_palette").and_then(|v| v.as_str()) == Some("colorblind") {
