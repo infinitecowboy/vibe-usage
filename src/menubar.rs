@@ -114,6 +114,11 @@ unsafe fn register_menu_handler() -> id {
         SETTINGS_CHANGED.store(true, Ordering::Relaxed);
     }
 
+    extern "C" fn toggle_pill_outline_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| s.pill_outline = !s.pill_outline);
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
     extern "C" fn toggle_show_in_dock_action(_this: &Object, _cmd: Sel, _sender: id) {
         settings::update(|s| s.show_in_dock = !s.show_in_dock);
         let show = settings::get().show_in_dock;
@@ -196,6 +201,10 @@ unsafe fn register_menu_handler() -> id {
     decl.add_method(
         sel!(toggleNeutralTextAction:),
         toggle_neutral_text_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(togglePillOutlineAction:),
+        toggle_pill_outline_action as extern "C" fn(&Object, Sel, id),
     );
     decl.add_method(
         sel!(toggleShowInDockAction:),
@@ -1262,6 +1271,19 @@ unsafe fn settings_submenu_item(cfg: &settings::Settings) -> id {
     }
     let () = msg_send![sub, addItem: num_toggle];
 
+    // ── Pill Outline toggle ──
+    let outline_toggle: id = msg_send![class!(NSMenuItem), alloc];
+    let outline_toggle: id = msg_send![outline_toggle,
+        initWithTitle: NSString::alloc(nil).init_str("Pill Outline")
+        action: sel!(togglePillOutlineAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![outline_toggle, setTarget: handler];
+    if cfg.pill_outline {
+        let () = msg_send![outline_toggle, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: outline_toggle];
+
     let () = msg_send![sub, addItem: separator()];
 
     // ── Monochrome toggle ──
@@ -1629,9 +1651,30 @@ unsafe fn render_pill_image(sections: &[SectionInfo], cfg: &settings::Settings) 
         total_w += sec_w;
     }
 
+    let outline = cfg.pill_outline;
+
     let img: id = msg_send![class!(NSImage), alloc];
     let img: id = msg_send![img, initWithSize: NSSize::new(total_w, img_h)];
     let () = msg_send![img, lockFocus];
+
+    // Outline mode: draw a single rounded-rect border around all sections
+    if outline {
+        // Measure max text height for the outline rect
+        let max_text_h = pill_sections
+            .iter()
+            .map(|ps| ps.label_size.height)
+            .fold(0.0f64, f64::max);
+        let outline_rect = NSRect::new(
+            NSPoint::new(0.5, (img_h - max_text_h - PILL_PAD_V * 2.0) / 2.0 + 0.5),
+            NSSize::new(total_w - 1.0, max_text_h + PILL_PAD_V * 2.0 - 1.0),
+        );
+        let outline_color = NSColor_rgba(1.0, 1.0, 1.0, 0.4);
+        let () = msg_send![outline_color, setStroke];
+        let path: id =
+            msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: outline_rect xRadius: PILL_CORNER_RADIUS yRadius: PILL_CORNER_RADIUS];
+        let () = msg_send![path, setLineWidth: 1.0f64];
+        let () = msg_send![path, stroke];
+    }
 
     let mut x = 0.0f64;
     for (i, ps) in pill_sections.iter().enumerate() {
@@ -1649,8 +1692,8 @@ unsafe fn render_pill_image(sections: &[SectionInfo], cfg: &settings::Settings) 
 
         let is_active = i == active;
 
-        // Draw pill background for active section
-        if is_active {
+        // Draw filled pill background for active section (non-outline mode only)
+        if !outline && is_active {
             let pill_rect = NSRect::new(
                 NSPoint::new(x, (img_h - ps.label_size.height - PILL_PAD_V * 2.0) / 2.0),
                 NSSize::new(sec_w, ps.label_size.height + PILL_PAD_V * 2.0),
@@ -1680,7 +1723,10 @@ unsafe fn render_pill_image(sections: &[SectionInfo], cfg: &settings::Settings) 
 
         // Draw text
         if ps.has_text {
-            let text_color = if is_active {
+            let text_color = if outline {
+                // Outline mode: all text in uniform white
+                NSColor_rgba(1.0, 1.0, 1.0, 0.7)
+            } else if is_active {
                 NSColor_rgba(0.0, 0.0, 0.0, 0.85)
             } else {
                 NSColor_rgba(1.0, 1.0, 1.0, 0.5)

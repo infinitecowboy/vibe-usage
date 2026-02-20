@@ -115,6 +115,8 @@ pub struct Settings {
     #[serde(default)]
     pub neutral_text: bool,
     #[serde(default)]
+    pub pill_outline: bool,
+    #[serde(default)]
     pub show_in_dock: bool,
 }
 
@@ -160,6 +162,7 @@ impl Default for Settings {
             },
             icons_colored: true,
             neutral_text: true,
+            pill_outline: false,
             show_in_dock: false,
         }
     }
