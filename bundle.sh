@@ -19,4 +19,11 @@ codesign --force --deep --sign - "$APP"
 # Register with Launch Services so Finder/Dock pick up the icon
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister "$APP"
 
+# Install to /Applications
+DEST="/Applications/Vibe Usage.app"
+rm -rf "$DEST"
+cp -R "$APP" "$DEST"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister "$DEST"
+
 echo "Built: $APP"
+echo "Installed: $DEST"
