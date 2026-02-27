@@ -138,6 +138,10 @@ unsafe fn register_menu_handler() -> id {
                 2 => Some(settings::DisplaySizeClass::Large),
                 _ => None,
             };
+            // Auto-enable Auto Display Mode when selecting a simulate option
+            if s.display_mode == settings::DisplayMode::Manual {
+                s.display_mode = settings::DisplayMode::Auto;
+            }
         });
         SETTINGS_CHANGED.store(true, Ordering::Relaxed);
     }
@@ -1649,6 +1653,8 @@ fn classify_menu_bar_display() -> settings::DisplaySizeClass {
     unsafe {
         let display_id = CGMainDisplayID();
         let size_mm = CGDisplayScreenSize(display_id);
+        let is_builtin = CGDisplayIsBuiltin(display_id) != 0;
+        let px_wide = CGDisplayPixelsWide(display_id);
 
         // If we get valid physical dimensions, compute diagonal in inches
         if size_mm.width > 0.0 && size_mm.height > 0.0 {
@@ -1656,28 +1662,40 @@ fn classify_menu_bar_display() -> settings::DisplaySizeClass {
                 (size_mm.width * size_mm.width + size_mm.height * size_mm.height).sqrt();
             let diag_inches = diag_mm / 25.4;
 
-            return if diag_inches < 16.0 {
+            let class = if diag_inches < 16.0 {
                 settings::DisplaySizeClass::Compact
             } else if diag_inches <= 25.0 {
                 settings::DisplaySizeClass::Medium
             } else {
                 settings::DisplaySizeClass::Large
             };
+            tracing::info!(
+                diag_inches = format!("{:.1}", diag_inches),
+                w_mm = format!("{:.0}", size_mm.width),
+                h_mm = format!("{:.0}", size_mm.height),
+                px_wide,
+                is_builtin,
+                class = ?class,
+                "Display classified"
+            );
+            return class;
         }
 
         // Fallback: built-in display → Compact, else estimate from pixel width
-        if CGDisplayIsBuiltin(display_id) != 0 {
+        if is_builtin {
+            tracing::info!(px_wide, "Built-in display fallback → Compact");
             return settings::DisplaySizeClass::Compact;
         }
 
-        let px_wide = CGDisplayPixelsWide(display_id);
-        if px_wide >= 3840 {
+        let class = if px_wide >= 3840 {
             settings::DisplaySizeClass::Large
         } else if px_wide >= 2560 {
             settings::DisplaySizeClass::Medium
         } else {
             settings::DisplaySizeClass::Compact
-        }
+        };
+        tracing::info!(px_wide, class = ?class, "Pixel-width fallback");
+        class
     }
 }
 
