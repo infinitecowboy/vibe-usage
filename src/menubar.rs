@@ -119,6 +119,29 @@ unsafe fn register_menu_handler() -> id {
         SETTINGS_CHANGED.store(true, Ordering::Relaxed);
     }
 
+    extern "C" fn toggle_auto_display_mode_action(_this: &Object, _cmd: Sel, _sender: id) {
+        settings::update(|s| {
+            s.display_mode = match s.display_mode {
+                settings::DisplayMode::Manual => settings::DisplayMode::Auto,
+                settings::DisplayMode::Auto => settings::DisplayMode::Manual,
+            };
+        });
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
+    extern "C" fn set_display_size_override_action(_this: &Object, _cmd: Sel, sender: id) {
+        let tag: isize = unsafe { msg_send![sender, tag] };
+        settings::update(|s| {
+            s.display_size_override = match tag {
+                0 => Some(settings::DisplaySizeClass::Compact),
+                1 => Some(settings::DisplaySizeClass::Medium),
+                2 => Some(settings::DisplaySizeClass::Large),
+                _ => None,
+            };
+        });
+        SETTINGS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
     extern "C" fn toggle_show_in_dock_action(_this: &Object, _cmd: Sel, _sender: id) {
         settings::update(|s| s.show_in_dock = !s.show_in_dock);
         let show = settings::get().show_in_dock;
@@ -217,6 +240,14 @@ unsafe fn register_menu_handler() -> id {
     decl.add_method(
         sel!(setThresholdsAction:),
         set_thresholds_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(toggleAutoDisplayModeAction:),
+        toggle_auto_display_mode_action as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(setDisplaySizeOverrideAction:),
+        set_display_size_override_action as extern "C" fn(&Object, Sel, id),
     );
 
     decl.register();
@@ -1284,6 +1315,62 @@ unsafe fn settings_submenu_item(cfg: &settings::Settings) -> id {
     }
     let () = msg_send![sub, addItem: outline_toggle];
 
+    // ── Auto Display Mode toggle ──
+    let auto_display_item: id = msg_send![class!(NSMenuItem), alloc];
+    let auto_display_item: id = msg_send![auto_display_item,
+        initWithTitle: NSString::alloc(nil).init_str("Auto Display Mode")
+        action: sel!(toggleAutoDisplayModeAction:)
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![auto_display_item, setTarget: handler];
+    if cfg.display_mode == settings::DisplayMode::Auto {
+        let () = msg_send![auto_display_item, setState: 1i64];
+    }
+    let () = msg_send![sub, addItem: auto_display_item];
+
+    // ── Simulate Display submenu ──
+    let sim_sub: id = msg_send![class!(NSMenu), new];
+    let sim_labels = [
+        ("Compact (<16\")", 0isize),
+        ("Medium (16\u{2013}25\")", 1isize),
+        ("Large (>25\")", 2isize),
+        ("Off (Real Display)", 3isize),
+    ];
+    let is_auto = cfg.display_mode == settings::DisplayMode::Auto;
+    for (label, tag) in &sim_labels {
+        let item: id = msg_send![class!(NSMenuItem), alloc];
+        let item: id = msg_send![item,
+            initWithTitle: NSString::alloc(nil).init_str(label)
+            action: sel!(setDisplaySizeOverrideAction:)
+            keyEquivalent: NSString::alloc(nil).init_str("")
+        ];
+        let () = msg_send![item, setTarget: handler];
+        let () = msg_send![item, setTag: *tag];
+        // Checkmark on the active override (or "Off" if None)
+        let is_checked = match (cfg.display_size_override, tag) {
+            (Some(settings::DisplaySizeClass::Compact), 0) => true,
+            (Some(settings::DisplaySizeClass::Medium), 1) => true,
+            (Some(settings::DisplaySizeClass::Large), 2) => true,
+            (None, 3) => true,
+            _ => false,
+        };
+        if is_checked {
+            let () = msg_send![item, setState: 1i64];
+        }
+        if !is_auto {
+            let () = msg_send![item, setEnabled: NO];
+        }
+        let () = msg_send![sim_sub, addItem: item];
+    }
+    let sim_parent: id = msg_send![class!(NSMenuItem), alloc];
+    let sim_parent: id = msg_send![sim_parent,
+        initWithTitle: NSString::alloc(nil).init_str("Simulate Display")
+        action: cocoa::base::nil
+        keyEquivalent: NSString::alloc(nil).init_str("")
+    ];
+    let () = msg_send![sim_parent, setSubmenu: sim_sub];
+    let () = msg_send![sub, addItem: sim_parent];
+
     let () = msg_send![sub, addItem: separator()];
 
     // ── Monochrome toggle ──
@@ -1550,6 +1637,50 @@ fn active_section_index(sections: &[SectionInfo]) -> usize {
     best
 }
 
+/// Detect the primary display's diagonal size and classify it.
+fn classify_menu_bar_display() -> settings::DisplaySizeClass {
+    extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayScreenSize(display: u32) -> cocoa::foundation::NSSize;
+        fn CGDisplayIsBuiltin(display: u32) -> i32;
+        fn CGDisplayPixelsWide(display: u32) -> usize;
+    }
+
+    unsafe {
+        let display_id = CGMainDisplayID();
+        let size_mm = CGDisplayScreenSize(display_id);
+
+        // If we get valid physical dimensions, compute diagonal in inches
+        if size_mm.width > 0.0 && size_mm.height > 0.0 {
+            let diag_mm =
+                (size_mm.width * size_mm.width + size_mm.height * size_mm.height).sqrt();
+            let diag_inches = diag_mm / 25.4;
+
+            return if diag_inches < 16.0 {
+                settings::DisplaySizeClass::Compact
+            } else if diag_inches <= 25.0 {
+                settings::DisplaySizeClass::Medium
+            } else {
+                settings::DisplaySizeClass::Large
+            };
+        }
+
+        // Fallback: built-in display → Compact, else estimate from pixel width
+        if CGDisplayIsBuiltin(display_id) != 0 {
+            return settings::DisplaySizeClass::Compact;
+        }
+
+        let px_wide = CGDisplayPixelsWide(display_id);
+        if px_wide >= 3840 {
+            settings::DisplaySizeClass::Large
+        } else if px_wide >= 2560 {
+            settings::DisplaySizeClass::Medium
+        } else {
+            settings::DisplaySizeClass::Compact
+        }
+    }
+}
+
 /// Render a pill-style menubar image using native NSFont drawing.
 /// The active section (highest usage) gets a white pill background with dark text.
 /// Other sections are dimmed. Small colored dots indicate usage level.
@@ -1615,21 +1746,39 @@ unsafe fn render_pill_image(sections: &[SectionInfo], cfg: &settings::Settings) 
         has_text: bool,
     }
 
+    // Compute effective display flags based on display_mode
+    let (effective_show_icon, effective_show_text, effective_show_number) =
+        match cfg.display_mode {
+            settings::DisplayMode::Manual => (cfg.show_icon, true, cfg.show_number),
+            settings::DisplayMode::Auto => {
+                let size_class = cfg
+                    .display_size_override
+                    .unwrap_or_else(classify_menu_bar_display);
+                match size_class {
+                    settings::DisplaySizeClass::Compact => (true, false, false),
+                    settings::DisplaySizeClass::Medium => (true, true, false),
+                    settings::DisplaySizeClass::Large => (true, true, true),
+                }
+            }
+        };
+
     let mut pill_sections: Vec<PillSection> = Vec::new();
 
     for sec in sections.iter() {
-        let text = if cfg.show_number {
-            format!("{} {:.0}%", sec.label, sec.pct)
+        let (has_text, text) = if !effective_show_text {
+            (false, String::new())
+        } else if effective_show_number {
+            (true, format!("{} {:.0}%", sec.label, sec.pct))
         } else {
-            sec.label.to_string()
+            (true, sec.label.to_string())
         };
         let ns_str = NSString::alloc(nil).init_str(&text);
         let size: NSSize = msg_send![ns_str, sizeWithAttributes: measure_attrs];
         pill_sections.push(PillSection {
             label_ns: ns_str,
             label_size: size,
-            has_dot: cfg.show_icon,
-            has_text: true,
+            has_dot: effective_show_icon,
+            has_text,
         });
     }
 

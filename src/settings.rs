@@ -21,6 +21,27 @@ impl Default for IconType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DisplayMode {
+    Manual,
+    Auto,
+}
+
+impl Default for DisplayMode {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplaySizeClass {
+    Compact,
+    Medium,
+    Large,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ColorPalette {
     Default,
     Monochrome,
@@ -118,6 +139,10 @@ pub struct Settings {
     pub pill_outline: bool,
     #[serde(default)]
     pub show_in_dock: bool,
+    #[serde(default)]
+    pub display_mode: DisplayMode,
+    #[serde(default)]
+    pub display_size_override: Option<DisplaySizeClass>,
 }
 
 fn default_icon_type() -> IconType {
@@ -164,6 +189,8 @@ impl Default for Settings {
             neutral_text: true,
             pill_outline: false,
             show_in_dock: false,
+            display_mode: DisplayMode::Manual,
+            display_size_override: None,
         }
     }
 }
