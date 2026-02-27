@@ -18,11 +18,12 @@ Vibe Usage lives in your menubar and shows session, weekly, and Sonnet-only usag
 ## Features
 
 - **Live usage tracking** — Session (5-hour), weekly (7-day), and Sonnet-only limits with progress bars and reset countdowns
-- **Menubar indicator** — Choose from 4 icon styles (Dot, SignalBars, MiniBars, DotGrid) with color-coded thresholds
+- **Menubar indicator** — Pill-style icon with color-coded usage dots and configurable text
 - **24-hour sparkline** — Trend chart showing session and weekly usage over time
 - **Desktop notifications** — Configurable alerts when usage crosses thresholds
 - **Auto-refresh** — Polls every 1/2/5/10 minutes (configurable)
 - **Dark mode native** — Built with native Cocoa APIs, adapts to system appearance
+- **Auto display mode** — Automatically adapts the menubar pill based on display size: dots only on small screens (<16"), labels on medium (16–25"), full percentages on large (>25"). Includes a simulate submenu for testing each layout
 - **Launch at Login** — Optional LaunchAgent for auto-start
 
 ## Prerequisites
@@ -77,9 +78,11 @@ Settings are stored at `~/.vibe-usage/settings.json` and can be changed from the
 
 | Setting | Options | Default |
 |---|---|---|
-| Icon Type | Dot, SignalBars, MiniBars, DotGrid | Dot |
 | Show Icon / Show Number | Toggle each independently | Both on |
 | Visible Sections | Session, Weekly, Sonnet, Extra Usage | Session + Weekly |
+| Pill Outline | Bordered outline style for the menubar pill | Off |
+| Auto Display Mode | Auto-adapt pill layout to display size | Off (Manual) |
+| Simulate Display | Force Compact / Medium / Large for testing | Off (Real Display) |
 | Color Palette | Default (green→red) or Monochrome | Default |
 | Usage Thresholds | Default (50/75/90%) or Conservative (30/60/90%) | Default |
 | Auto Refresh Interval | 1, 2, 5, or 10 minutes | 5 min |
