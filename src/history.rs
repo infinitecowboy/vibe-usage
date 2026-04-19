@@ -95,6 +95,7 @@ pub fn record(usage: &ParsedUsage) {
 }
 
 /// Get a copy of the history entries (sorted by timestamp).
+#[allow(dead_code)]
 pub fn get_history() -> Vec<HistoryEntry> {
     HISTORY
         .get()
