@@ -196,6 +196,7 @@ impl MenubarApp {
         });
 
         let mut last_rendered: Option<ParsedUsage> = None;
+        let mut last_dark: bool = unsafe { is_dark_appearance() };
 
         event_loop.run(move |event, _, cf| {
             *cf = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500));
@@ -209,12 +210,16 @@ impl MenubarApp {
 
                 let settings_dirty = SETTINGS_CHANGED.swap(false, Ordering::Relaxed);
 
+                let cur_dark = unsafe { is_dark_appearance() };
+                let appearance_changed = cur_dark != last_dark;
+                last_dark = cur_dark;
+
                 let current_usage = {
                     let s = state.lock().unwrap();
                     s.usage.clone()
                 };
 
-                if current_usage != last_rendered || settings_dirty {
+                if current_usage != last_rendered || settings_dirty || appearance_changed {
                     if let Some(si) = STATUS_ITEM.get() {
                         let si = si.lock().unwrap();
                         unsafe {
@@ -1048,13 +1053,47 @@ unsafe fn tertiary_color() -> id {
 }
 
 unsafe fn track_color() -> id {
-    // Dim neutral for both menubar track and segmented bar empty cells
+    // Dim neutral — adapts so it reads on both dark and light menubars/menus.
     use cocoa::appkit::NSColor;
-    NSColor::colorWithRed_green_blue_alpha_(nil, 1.0, 1.0, 1.0, 0.18)
+    if is_dark_appearance() {
+        NSColor::colorWithRed_green_blue_alpha_(nil, 1.0, 1.0, 1.0, 0.22)
+    } else {
+        NSColor::colorWithRed_green_blue_alpha_(nil, 0.0, 0.0, 0.0, 0.13)
+    }
 }
 
 unsafe fn menubar_text_color() -> id {
-    msg_send![class!(NSColor), labelColor]
+    // labelColor bakes to black at lockFocus time regardless of menubar appearance.
+    // Choose explicitly so the % stays readable in both modes.
+    use cocoa::appkit::NSColor;
+    if is_dark_appearance() {
+        NSColor::colorWithRed_green_blue_alpha_(nil, 1.0, 1.0, 1.0, 0.92)
+    } else {
+        NSColor::colorWithRed_green_blue_alpha_(nil, 0.0, 0.0, 0.0, 0.87)
+    }
+}
+
+unsafe fn is_dark_appearance() -> bool {
+    let app = NSApp();
+    if app == nil {
+        return true;
+    }
+    let appearance: id = msg_send![app, effectiveAppearance];
+    if appearance == nil {
+        return true;
+    }
+    let dark_name = NSString::alloc(nil).init_str("NSAppearanceNameDarkAqua");
+    let aqua_name = NSString::alloc(nil).init_str("NSAppearanceNameAqua");
+    let names: id = msg_send![class!(NSArray),
+        arrayWithObjects: [dark_name, aqua_name].as_ptr()
+        count: 2usize
+    ];
+    let matched: id = msg_send![appearance, bestMatchFromAppearancesWithNames: names];
+    if matched == nil {
+        return true;
+    }
+    let is_dark: bool = msg_send![matched, isEqualToString: dark_name];
+    is_dark
 }
 
 unsafe fn menubar_font(size: f64) -> id {
